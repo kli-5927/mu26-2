@@ -763,6 +763,7 @@
       const [studentIdInput, setStudentIdInput] = useState('');
       const [studentPwInput, setStudentPwInput] = useState('');
       const [studentNameInput, setStudentNameInput] = useState('');
+      const [registerClass, setRegisterClass] = useState('');
       const [isRegisterMode, setIsRegisterMode] = useState(false);
       const [authBusy, setAuthBusy] = useState(false);
 
@@ -942,14 +943,33 @@
       // [클라우드 연동]
       // =========================================================
 
-      // 모둠 정보 불러오기: 학생은 공연 제목·영상·조원만(+자기 조 점수는 따로), 교사는 점수까지 전부
-      const fetchGroupInfo = async function(u) {
+      // 모둠 정보 불러오기
+      //   교사: 모든 반, 점수까지 전부
+      //   학생: 자기 반만 (공연 제목·영상·조원). 반이 아직 없으면 반을 고를 수 있게 제목·조원만 (영상 링크 없음)
+      //   학생 기기에는 받아 온 것만 남기고 다른 반 정보는 지움
+      const fetchGroupInfo = async function(u, classNo) {
         if (!cloudReady() || !u) return;
         try {
-          const cols = u.role === 'teacher' ? 'class_no, group_no, title, video_url, members, plan_score, perform_score' : 'class_no, group_no, title, video_url, members';
-          const res = await withTimeout(supabaseClient.from('group_info').select(cols));
-          if (!res.error && res.data) mergeGroupRows(res.data);
-          else if (isNetworkFailure(res)) markOffline();
+          if (u.role === 'teacher') {
+            const res = await withTimeout(supabaseClient.from('group_info').select('class_no, group_no, title, video_url, members, plan_score, perform_score'));
+            if (!res.error && res.data) mergeGroupRows(res.data);
+            else if (isNetworkFailure(res)) markOffline();
+            return;
+          }
+          const c = Number(classNo) || null;
+          let query = supabaseClient.from('group_info').select(c ? 'class_no, group_no, title, video_url, members' : 'class_no, group_no, title, members');
+          if (c) query = query.eq('class_no', c);
+          const res = await withTimeout(query);
+          if (!res.error && res.data) {
+            const fresh = {};
+            res.data.forEach(function(r) {
+              if (c && Number(r.class_no) !== c) return;
+              fresh[groupKey(r.class_no, r.group_no)] = { title: r.title || '', video_url: c ? (r.video_url || '') : '', members: r.members || '' };
+            });
+            groupInfoRef.current = fresh;
+            safeSetLocal('perf_group_info', JSON.stringify(fresh));
+            setGroupInfo(fresh);
+          } else if (isNetworkFailure(res)) markOffline();
         } catch (err) {
           if (isNetworkFailure(err)) markOffline();
         }
@@ -974,8 +994,7 @@
         const u = (userOverride && userOverride.role) ? userOverride : currentUserRef.current;
         if (!u) return;
         try {
-          if (u.role === 'teacher') setIsCloudSyncing(true);
-          fetchGroupInfo(u);
+          if (u.role === 'teacher') { setIsCloudSyncing(true); fetchGroupInfo(u); }
           let query = supabaseClient.from('submissions').select('student_id, data');
           if (u.role === 'student') query = query.eq('student_id', String(u.id));
           const res = await withTimeout(query);
@@ -995,6 +1014,7 @@
             });
             if (u.role === 'student') {
               const mine = res.data[0] && res.data[0].data;
+              await fetchGroupInfo(u, mine && mine.classNo);
               if (mine && mine.classNo && mine.groupNo) await fetchMyGroupScores(mine.classNo, mine.groupNo);
               setStudentCloudLoaded(function(n) { return n + 1; });
             }
@@ -1056,13 +1076,23 @@
             return undefined;
           }
           const g = res.data.grading || null;
+          const sc = res.data.classNo || null, sg = res.data.groupNo || null;
+          const before = loadLocalSubmissions()[u.id] || {};
+          const placeChanged = (sc || sg) && (Number(before.classNo || 0) !== Number(sc || 0) || Number(before.groupNo || 0) !== Number(sg || 0));
           setAllSubmissions(function(prev) {
             const mine = prev[u.id];
-            if (!mine || JSON.stringify(mine.grading || null) === JSON.stringify(g)) return prev;
-            const up = Object.assign({}, prev, { [u.id]: Object.assign({}, mine, { grading: g || undefined }) });
+            if (!mine) return prev;
+            const sameGrade = JSON.stringify(mine.grading || null) === JSON.stringify(g);
+            const samePlace = !(sc || sg) || (Number(mine.classNo || 0) === Number(sc || 0) && Number(mine.groupNo || 0) === Number(sg || 0));
+            if (sameGrade && samePlace) return prev;
+            const patch = { grading: g || undefined };
+            // 선생님이 반·조를 바꾸면 학생 화면에도 반영
+            if (!samePlace) { patch.classNo = sc || undefined; patch.groupNo = sg || undefined; }
+            const up = Object.assign({}, prev, { [u.id]: Object.assign({}, mine, patch) });
             safeSetLocal('perf_submissions', JSON.stringify(up));
             return up;
           });
+          if (placeChanged && sc) await fetchGroupInfo(u, sc);
           if (res.data.classNo && res.data.groupNo) await fetchMyGroupScores(res.data.classNo, res.data.groupNo);
           return g;
         } catch (err) {
@@ -1305,7 +1335,7 @@
       const registerOnThisDevice = function(id, name, pw, reason) {
         if (getStudentAccounts()[id]) { showToast('이 기기에 이미 등록된 학번입니다. [로그인]으로 들어가 주세요.'); return; }
         cacheLocalAccount(id, name, pw);
-        const offSub = loadLocalSubmissions()[id] || { studentId: id, studentName: name, reports: {} };
+        const offSub = loadLocalSubmissions()[id] || { studentId: id, studentName: name, classNo: Number(registerClass) || undefined, reports: {} };
         putLocalSub(id, offSub);
         addPendingSync(id);
         formDirtyRef.current = false;
@@ -1337,6 +1367,9 @@
         if (!ID_RULE.test(id)) { showToast('학번은 숫자 4~5자리로 입력해 주세요.'); return; }
         if (!name) { showToast('성명을 입력해 주세요.'); return; }
         if (!/^\d{4}$/.test(pw)) { showToast('비밀번호는 4자리 숫자여야 합니다.'); return; }
+        const regClass = Number(registerClass) || null;
+        if (!regClass) { showToast('내 반을 골라 주세요. (한 번 정하면 바꿀 수 없어요)'); return; }
+        if (!window.confirm(name + ' 학생, 2학년 ' + regClass + '반이 맞나요?\n등록한 뒤에는 반을 바꿀 수 없어요. (잘못 고르면 선생님께 말씀드려야 해요)')) return;
 
         if (!cloudReady()) { registerOnThisDevice(id, name, pw); return; }
         if (authBusy) return;
@@ -1375,7 +1408,7 @@
         }
 
         purgeLocalStudent(id);
-        const initSub = { studentId: id, studentName: name, reports: {} };
+        const initSub = { studentId: id, studentName: name, classNo: regClass, reports: {} };
         putLocalSub(id, initSub);
         syncStudentToCloud(id, initSub);
         cacheLocalAccount(id, name, pw);
@@ -1383,8 +1416,8 @@
         updateCurrentUserSession({ role: 'student', id: id, name: name });
         setIsRegisterMode(false);
         setMainTab('activity');
-        fetchGroupInfo({ role: 'student', id: id });
-        showToast(name + ' 님, 등록 및 로그인 완료! 먼저 내 반과 조를 골라 주세요. ☁️', 4000);
+        fetchGroupInfo({ role: 'student', id: id }, regClass);
+        showToast(name + ' 님, 등록 및 로그인 완료! 먼저 내 조를 골라 주세요. ☁️', 4000);
       };
 
       const handleStudentLogin = async function(ev) {
@@ -1736,7 +1769,13 @@
         if (!currentUser) return;
         if (currentUser.role !== 'student') { showToast('교사 미리보기 화면에서는 저장되지 않습니다.'); return; }
         if (saveBusy) return;
-        const f = actForm;
+        // 한 번 정해진 반·조는 학생이 바꿀 수 없음 (저장된 값을 그대로 씀)
+        const saved = allSubmissions[currentUser.id] || {};
+        const f = Object.assign({}, actForm, {
+          classNo: saved.classNo || actForm.classNo,
+          groupNo: saved.groupNo || actForm.groupNo
+        });
+        const firstPlace = !saved.classNo || !saved.groupNo;
         if (isSubmit) {
           const miss = findMissing(f);
           if (miss) { showToast(miss, 5000); return; }
@@ -1744,6 +1783,8 @@
           showToast('맨 위에서 내 반과 조를 먼저 골라 주세요.', 4000);
           return;
         }
+        if (firstPlace && f.classNo && f.groupNo &&
+            !window.confirm('2학년 ' + f.classNo + '반 ' + f.groupNo + '조가 맞나요?\n한 번 저장하면 반과 조를 바꿀 수 없어요. (잘못 골랐다면 선생님께 말씀드려야 해요)')) return;
         setSaveBusy(true);
         try {
           const blocked = await studentEditBlocked();
@@ -1847,6 +1888,7 @@
           if (sent) {
             removePendingSync(id);
             putLocalSub(id, fullData);
+            if (Number(saved.classNo || 0) !== Number(fullData.classNo)) await fetchGroupInfo(currentUser, fullData.classNo);
             fetchMyGroupScores(fullData.classNo, fullData.groupNo);
             showToast(isSubmit ? '최종 제출되었습니다! 선생님 화면에 바로 보입니다. 🎉' : '임시 저장되었습니다. (클라우드 저장 완료) 💾', 4000);
           } else {
@@ -2364,26 +2406,39 @@
 
       // 학생 작성 화면
       const renderStudentForm = function(isPreview) {
-        const f = actForm;
+        // 학생: 저장된 반·조는 고정 (교사 미리보기는 자유롭게 눌러 볼 수 있음)
+        const lockedClass = !isPreview && mySub && mySub.classNo ? Number(mySub.classNo) : null;
+        const lockedGroup = !isPreview && mySub && mySub.groupNo ? Number(mySub.groupNo) : null;
+        const f = Object.assign({}, actForm, lockedClass ? { classNo: lockedClass } : {}, lockedGroup ? { groupNo: lockedGroup } : {});
         const myGroup = Number(f.groupNo) || null;
         const myClass = Number(f.classNo) || null;
         const alreadySubmitted = !isPreview && myAct && myAct.isSubmitted;
+        const lockNote = function(key, text) {
+          return e('p', { key: key, className: 'text-2xs text-slate-500 flex items-center gap-1' }, e('i', { className: 'fa-solid fa-lock text-slate-400' }), text);
+        };
         return e('div', { className: 'space-y-4' },
-          sectionCard('0', '내 반과 조 고르기', '몇 조인지 모르겠으면 아래 공연 제목과 조원 이름을 보고 찾으세요. (선생님이 입력한 내용입니다)',
+          sectionCard('0', lockedGroup ? '내 반과 조' : (lockedClass ? '내 조 고르기' : '내 반과 조 고르기'),
+            lockedGroup ? '반과 조가 정해졌어요. 잘못되었다면 선생님께 말씀드려 주세요.'
+              : '몇 조인지 모르겠으면 아래 공연 제목과 조원 이름을 보고 찾으세요. 처음 저장할 때 정해지고, 그 뒤에는 바꿀 수 없어요.',
             [
-              e('div', { key: 'c', className: 'space-y-1.5' },
-                e('p', { className: 'text-xs font-bold text-slate-700' }, '반 (2학년)'),
-                e('div', { className: 'flex flex-wrap gap-2' }, CLASSES.map(function(c) {
-                  return chip(c, c + '반', myClass === c, function() { updateForm({ classNo: c }); });
-                }))
-              ),
+              lockedClass
+                ? e('div', { key: 'c', className: 'space-y-1' },
+                    e('p', { className: 'text-sm font-black text-violet-800' }, '2학년 ' + lockedClass + '반' + (lockedGroup ? ' ' + lockedGroup + '조' : '')),
+                    lockNote('cl', lockedGroup ? '반과 조는 바꿀 수 없어요. (선생님만 바꿀 수 있어요)' : '반은 바꿀 수 없어요. (선생님만 바꿀 수 있어요)')
+                  )
+                : e('div', { key: 'c', className: 'space-y-1.5' },
+                    e('p', { className: 'text-xs font-bold text-slate-700' }, '반 (2학년)'),
+                    e('div', { className: 'flex flex-wrap gap-2' }, CLASSES.map(function(c) {
+                      return chip(c, c + '반', myClass === c, function() { updateForm({ classNo: c }); });
+                    }))
+                  ),
               myClass && e('div', { key: 'g', className: 'space-y-1.5' },
-                e('p', { className: 'text-xs font-bold text-slate-700' }, myClass + '반 모둠 목록 — 내 조를 눌러 주세요'),
-                renderClassGroupList(myClass, myGroup, function(g) { updateForm({ groupNo: g }); })
+                e('p', { className: 'text-xs font-bold text-slate-700' }, myClass + '반 모둠 목록' + (lockedGroup ? '' : ' — 내 조를 눌러 주세요')),
+                renderClassGroupList(myClass, myGroup, lockedGroup ? null : function(g) { updateForm({ groupNo: g }); })
               ),
-              myClass && myGroup && e('p', { key: 'ok', className: 'text-xs font-bold text-violet-700' }, e('i', { className: 'fa-solid fa-circle-check mr-1' }), '나는 ' + myClass + '반 ' + myGroup + '조입니다.')
+              !lockedGroup && myClass && myGroup && e('p', { key: 'ok', className: 'text-xs font-bold text-violet-700' }, e('i', { className: 'fa-solid fa-circle-check mr-1' }), '나는 ' + myClass + '반 ' + myGroup + '조입니다. (처음 저장할 때 정해져요)')
             ],
-            { badge: '필수', badgeClass: 'bg-violet-100 text-violet-800' }
+            { badge: lockedGroup ? '확정' : '필수', badgeClass: lockedGroup ? 'bg-emerald-100 text-emerald-800' : 'bg-violet-100 text-violet-800' }
           ),
 
           sectionCard('1', '모둠 내 특별 활동 작성 (해당자만)', '모둠에서 아래 역할을 맡았다면 고르고, 어떤 활동을 했는지 적어 주세요. 해당 없으면 넘어가도 됩니다.',
@@ -3086,11 +3141,19 @@
           e('div', { className: 'max-w-7xl mx-auto flex flex-col lg:flex-row items-center justify-between gap-3' },
             e('div', { className: 'flex items-center gap-2 text-xs' },
               e('i', { className: 'fa-solid fa-lock text-amber-400' }),
-              e('span', null, '학번과 비밀번호(4자리)로 로그인해 주세요. 처음이면 [최초 등록하기]를 누르세요.')
+              e('span', null, isRegisterMode ? '학번·성명·반·비밀번호(4자리)를 넣어 주세요. 반은 등록한 뒤 바꿀 수 없어요.' : '학번과 비밀번호(4자리)로 로그인해 주세요. 처음이면 [최초 등록하기]를 누르세요.')
             ),
             isRegisterMode ? e('form', { onSubmit: handleStudentRegister, className: 'flex flex-wrap items-center justify-center gap-1.5' },
-              e('input', { type: 'text', inputMode: 'numeric', maxLength: 5, placeholder: '학번', value: studentIdInput, onChange: function(ev) { setStudentIdInput(ev.target.value); }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 w-20', required: true }),
+              e('input', { type: 'text', inputMode: 'numeric', maxLength: 5, placeholder: '학번', value: studentIdInput, onChange: function(ev) {
+                setStudentIdInput(ev.target.value);
+                const gc = guessClassFromId(ev.target.value.trim());
+                if (gc) setRegisterClass(String(gc));
+              }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 w-20', required: true }),
               e('input', { type: 'text', placeholder: '성명', value: studentNameInput, onChange: function(ev) { setStudentNameInput(ev.target.value); }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 w-20', required: true }),
+              e('select', { value: registerClass, onChange: function(ev) { setRegisterClass(ev.target.value); }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 bg-white', required: true, title: '내 반 (등록 후 바꿀 수 없어요)' },
+                e('option', { value: '' }, '반 선택'),
+                CLASSES.map(function(c) { return e('option', { key: c, value: String(c) }, '2학년 ' + c + '반'); })
+              ),
               e('input', { type: 'password', inputMode: 'numeric', maxLength: 4, placeholder: '비번 4자리', value: studentPwInput, onChange: function(ev) { setStudentPwInput(ev.target.value); }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 w-24', required: true }),
               e('button', { type: 'submit', disabled: authBusy, className: 'px-3 py-1.5 rounded bg-emerald-600 text-white font-bold text-xs ' + (authBusy ? 'opacity-60 cursor-wait' : '') }, authBusy ? '확인 중…' : '등록 완료'),
               e('button', { type: 'button', onClick: function() { setIsRegisterMode(false); }, className: 'text-2xs text-slate-300 underline ml-1' }, '로그인으로')
