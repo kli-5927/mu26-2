@@ -1413,6 +1413,3341 @@
         }
 
         purgeLocalStudent(id);
+        clearGroupCache();
+        const initSub = { studentId: id, studentName: name, classNo: regClass, groupNo: regGroup, reports: {} };
+        putLocalSub(id, initSub);
+        syncStudentToCloud(id, initSub);
+        cacheLocalAccount(id, name, pw);
+        formDirtyRef.current = false;
+        updateCurrentUserSession({ role: 'student', id: id, name: name });
+        setIsRegisterMode(false);
+        setMainTab('activity');
+        fetchGroupInfo({ role: 'student', id: id }, regClass);
+        fetchMyGroupScores(regClass, regGroup);
+        showToast(name + ' 님, 등록 및 로그인 완료! (' + regClass + '반 ' + regGroup + '조) ☁️', 4000);
+      };
+
+      const handleStudentLogin = async function(ev) {
+        ev.preventDefault();
+        const id = studentIdInput.trim();
+        const pw = studentPwInput;
+
+        if (!cloudReady()) { loginOnThisDevice(id, pw); return; }
+        if (authBusy) return;
+        let acc = null;
+        let goOffline = false;
+        setAuthBusy(true);
+        try {
+          const res = await cloudGetAccount(id);
+          if (res.error) {
+            if (isNetworkFailure(res)) { goOffline = true; } else { showAccountError(res.error); return; }
+          } else {
+            acc = res.data;
+            if (!acc) {
+              const local = getStudentAccounts()[id];
+              if (local && local.pw === pw) acc = await migrateLegacyAccount(id);
+            }
+          }
+        } catch (err) {
+          if (isNetworkFailure(err)) { goOffline = true; } else { showAccountError(err); return; }
+        } finally {
+          setAuthBusy(false);
+        }
+
+        if (goOffline) {
+          markOffline();
+          loginOnThisDevice(id, pw, OFFLINE_SWITCH_NOTE);
+          return;
+        }
+
+        if (!acc) {
+          purgeLocalStudent(id);
+          showToast('등록되지 않은 학번입니다. [최초 등록하기]를 눌러주세요.');
+          return;
+        }
+        if (acc.pw !== pw) { showToast('비밀번호가 일치하지 않습니다.'); return; }
+        const loggedUser = { role: 'student', id: String(acc.student_id), name: acc.name };
+        clearGroupCache();
+        cacheLocalAccount(loggedUser.id, acc.name, acc.pw);
+        formDirtyRef.current = false;
+        updateCurrentUserSession(loggedUser);
+        setMainTab('activity');
+        showToast(acc.name + ' 님, 환영합니다!');
+        finalPopupPendingRef.current = true;
+        setStudentCloudLoaded(0);
+        await pushPendingForStudent(loggedUser.id);
+        fetchSubmissionsFromCloud(loggedUser);
+      };
+
+      // =========================================================
+      // [교사 로그인] 서버(teacher_login 함수)에서 확인
+      // =========================================================
+      const isMissingFunction = function(err) {
+        if (!err) return false;
+        return err.code === 'PGRST202' || err.code === '42883' || /Could not find the function|does not exist/i.test(String(err.message || ''));
+      };
+
+      const finishTeacherLogin = function(id) {
+        const tUser = { role: 'teacher', id: id, name: '음악 교사' };
+        updateCurrentUserSession(tUser);
+        setShowTeacherModal(false);
+        setTeacherIdInput('');
+        setTeacherPwInput('');
+        setNewTeacherId(id);
+        setMainTab('teacher_dash');
+        setTeacherSubTab('submissions');
+        fetchSubmissionsFromCloud(tUser);
+        showToast('교사 관리자 모드로 접속했습니다. 🛡️');
+      };
+
+      const localTeacherLogin = function(id, pw, allowDefault, note) {
+        let saved = null;
+        try { const s0 = localStorage.getItem('perf_teacher_auth'); saved = s0 ? JSON.parse(s0) : null; } catch (err) { saved = null; }
+        const auth = saved || (allowDefault ? { id: 'klidaum', pw: '123456' } : null);
+        if (auth && id === auth.id && pw === auth.pw) {
+          finishTeacherLogin(id);
+          if (note) showToast(note, 6000);
+          return;
+        }
+        showToast(auth ? '아이디 또는 6자리 비밀번호가 일치하지 않습니다.' : '서버 응답이 없어 지금은 이 컴퓨터에서 교사 로그인을 확인할 수 없습니다. 잠시 후 다시 시도해 주세요.', 6000);
+      };
+
+      const handleTeacherLogin = async function(ev) {
+        ev.preventDefault();
+        const id = teacherIdInput.trim();
+        const pw = teacherPwInput;
+        if (!cloudReady()) { localTeacherLogin(id, pw, false, '서버 응답이 없어 이 컴퓨터에 저장된 계정으로 접속했습니다.'); return; }
+        if (authBusy) return;
+        setAuthBusy(true);
+        let result = null, err = null;
+        try {
+          const res = await withTimeout(supabaseClient.rpc('teacher_login', { p_id: id, p_pw: pw }), SERVER_CHECK_MS);
+          if (res.error) err = res.error; else result = res.data;
+        } catch (e2) {
+          err = e2;
+        } finally {
+          setAuthBusy(false);
+        }
+
+        if (err) {
+          if (isNetworkFailure(err) || (err && err.message === 'TIMEOUT')) {
+            markOffline();
+            localTeacherLogin(id, pw, false, '서버 응답이 없어 이 컴퓨터에 저장된 계정으로 접속했습니다.');
+          } else if (isMissingFunction(err)) {
+            localTeacherLogin(id, pw, true, '아직 서버에 교사 계정이 설정되지 않아 이 컴퓨터의 계정으로 접속했습니다. 안내된 SQL을 실행해 주세요.');
+          } else {
+            showAccountError(err);
+          }
+          return;
+        }
+        if (result === 'ok') { finishTeacherLogin(id); return; }
+        if (result === 'locked') { showToast('비밀번호를 10번 틀려 10분 동안 교사 로그인이 잠겼습니다. 잠시 후 다시 시도해 주세요.', 7000); return; }
+        if (result === 'no_account') { localTeacherLogin(id, pw, true, '서버에 교사 계정이 없어 이 컴퓨터의 계정으로 접속했습니다. 안내된 SQL을 실행해 주세요.'); return; }
+        showToast('아이디 또는 6자리 비밀번호가 일치하지 않습니다.');
+      };
+
+      // 이 기기에 남아 있는 모둠 정보(영상 링크 포함) 지우기 — 다른 사람이 같은 기기를 써도 보이지 않도록
+      const clearGroupCache = function() {
+        groupInfoRef.current = {};
+        setGroupInfo({});
+        try { localStorage.removeItem('perf_group_info'); } catch (err) {}
+      };
+      const handleLogout = function() {
+        clearGroupCache();
+        updateCurrentUserSession(null);
+        formDirtyRef.current = false;
+        setMainTab('activity');
+        setGradingStudentId(null);
+        showToast('로그아웃되었습니다.');
+      };
+
+      // [교사] 제출 마감 설정 (action: 'set_deadline' | 'clear_deadline' | 'close_now' | 'reopen')
+      const setPortalByTeacher = async function(action) {
+        if (deadlineBusy) return;
+        if (!/^\d{6}$/.test(deadlinePw)) { showToast('확인을 위해 교사 비밀번호 6자리를 입력해 주세요.'); return; }
+        let iso = null;
+        if (action === 'set_deadline') {
+          if (!deadlineInput) { showToast('마감 날짜와 시간을 선택해 주세요.'); return; }
+          const d = new Date(deadlineInput);
+          if (isNaN(d.getTime())) { showToast('마감 날짜와 시간을 다시 선택해 주세요.'); return; }
+          iso = d.toISOString();
+        }
+        if (action === 'close_now' && !window.confirm('지금 바로 마감할까요? 학생들은 즉시 작성·수정·제출을 할 수 없게 됩니다.')) return;
+        if (!cloudReady()) { showToast(SERVER_DOWN_MSG, 6000); return; }
+        setDeadlineBusy(true);
+        try {
+          const res = await withTimeout(supabaseClient.rpc('teacher_set_portal', {
+            p_id: (currentUser && currentUser.id) || '', p_pw: deadlinePw,
+            p_action: action === 'clear_deadline' ? 'set_deadline' : action,
+            p_deadline: iso
+          }), SERVER_CHECK_MS);
+          if (res.error) {
+            if (isNetworkFailure(res)) { markOffline(); showToast(SERVER_DOWN_MSG, 6000); return; }
+            if (isMissingFunction(res.error)) {
+              showToast('서버에 마감 기능이 아직 설정되지 않았습니다. 통합 SQL을 먼저 실행해 주세요.', 7000);
+              return;
+            }
+            showAccountError(res.error);
+            return;
+          }
+          if (res.data === 'ok') {
+            await refreshPortalStatus();
+            setDeadlinePw('');
+            const msg = action === 'set_deadline' ? '자동 마감 시각을 ' + formatDeadline(iso) + '(으)로 저장했습니다. ⏰'
+              : action === 'clear_deadline' ? '자동 마감 시각을 지웠습니다.'
+              : action === 'close_now' ? '지금 바로 마감했습니다. 학생들은 더 이상 작성·제출할 수 없습니다. 🔒'
+              : '제출을 다시 열었습니다. (자동 마감 시각도 지워졌어요) 🔓';
+            showToast(msg, 6000);
+          } else if (res.data === 'locked') {
+            showToast('비밀번호를 여러 번 틀려 10분 동안 잠겼습니다. 잠시 후 다시 시도해 주세요.', 6000);
+          } else {
+            showToast('교사 비밀번호가 맞지 않습니다.');
+          }
+        } catch (err) {
+          if (isNetworkFailure(err)) markOffline();
+          showToast(SERVER_DOWN_MSG, 6000);
+        } finally {
+          setDeadlineBusy(false);
+        }
+      };
+
+      const handleSaveTeacherAuth = async function(ev) {
+        ev.preventDefault();
+        const newId = newTeacherId.trim();
+        if (!newId) { showToast('교사 아이디를 입력해 주세요.'); return; }
+        if (!/^\d{6}$/.test(newTeacherPw)) { showToast('새 비밀번호는 반드시 6자리 숫자여야 합니다.'); return; }
+        if (!currentTeacherPw) { showToast('지금 쓰고 있는 비밀번호를 입력해 주세요.'); return; }
+        const oldId = (currentUser && currentUser.id) || teacherAuth.id;
+
+        const saveLocal = function() {
+          const updated = { id: newId, pw: newTeacherPw };
+          setTeacherAuth(updated);
+          safeSetLocal('perf_teacher_auth', JSON.stringify(updated));
+          updateCurrentUserSession({ role: 'teacher', id: newId, name: '음악 교사' });
+          setNewTeacherPw('');
+          setCurrentTeacherPw('');
+        };
+
+        if (!cloudReady()) { showToast(SERVER_DOWN_MSG, 6000); return; }
+        try {
+          const res = await withTimeout(supabaseClient.rpc('teacher_change_auth', { p_old_id: oldId, p_old_pw: currentTeacherPw, p_new_id: newId, p_new_pw: newTeacherPw }), SERVER_CHECK_MS);
+          if (res.error) {
+            if (isMissingFunction(res.error)) {
+              if (currentTeacherPw !== teacherAuth.pw) { showToast('지금 쓰고 있는 비밀번호가 맞지 않습니다.'); return; }
+              saveLocal();
+              showToast('이 컴퓨터에만 저장했습니다. 다른 컴퓨터에서도 쓰려면 안내된 SQL을 먼저 실행해 주세요.', 6000);
+              return;
+            }
+            if (isNetworkFailure(res)) { markOffline(); showToast(SERVER_DOWN_MSG, 6000); return; }
+            showAccountError(res.error);
+            return;
+          }
+          if (res.data === 'ok') {
+            saveLocal();
+            showToast('교사 아이디와 비밀번호가 서버에 저장되었습니다. 이제 어느 컴퓨터에서든 새 정보로 로그인하세요. 🔒', 6000);
+          } else if (res.data === 'locked') {
+            showToast('비밀번호를 여러 번 틀려 10분 동안 잠겼습니다. 잠시 후 다시 시도해 주세요.', 6000);
+          } else {
+            showToast('지금 쓰고 있는 비밀번호가 맞지 않습니다.');
+          }
+        } catch (err) {
+          if (isNetworkFailure(err)) markOffline();
+          showToast(SERVER_DOWN_MSG, 6000);
+        }
+      };
+
+      // [학생] 저장 직전 확인: 마감이면 'deadline', 점수가 확정됐으면 'confirmed', 아니면 null
+      const studentEditBlocked = async function() {
+        if (!currentUser || currentUser.role !== 'student') return null;
+        if (isPortalClosedNow()) return 'deadline';
+        if (getConfirmed(allSubmissions[currentUser.id])) return 'confirmed';
+        if (cloudReady()) {
+          const np = await refreshPortalStatus();
+          if (np && isPortalClosedNow(np)) return 'deadline';
+          const g = await checkMyGrading(currentUser);
+          if (g && g.confirmed) return 'confirmed';
+        }
+        return null;
+      };
+
+      // =========================================================
+      // [학생] 작성 양식
+      // =========================================================
+      const myId = currentUser && currentUser.role === 'student' ? currentUser.id : null;
+      const mySub = myId ? allSubmissions[myId] : null;
+      const myAct = mySub && mySub.reports && mySub.reports.act;
+      const formSyncKey = myId ? [myId, mySub ? (mySub.classNo || '') + '-' + (mySub.groupNo || '') : '', myAct ? myAct.updatedAt + ':' + (myAct.isSubmitted ? 1 : 0) : 'none'].join('|') : '';
+      useEffect(function() {
+        if (!myId) return;
+        if (formDirtyRef.current) return;
+        const base = Object.assign(emptyAct(), JSON.parse(JSON.stringify(myAct || {})));
+        base.roles = Object.assign({ lead: false, cuesheet: false, editor: false }, base.roles || {});
+        base.roleDetails = Object.assign({ lead: '', cuesheet: '', editor: '' }, base.roleDetails || {});
+        base.perfTypes = (base.perfTypes || []).slice();
+        base.perfDetails = base.perfDetails || {};
+        base.peerChecks = base.peerChecks || {};
+        base.evals = base.evals || {};
+        setActForm(Object.assign(base, {
+          classNo: (mySub && mySub.classNo) || guessClassFromId(myId) || '',
+          groupNo: (mySub && mySub.groupNo) || ''
+        }));
+      }, [formSyncKey]);
+
+      const updateForm = function(patch) {
+        formDirtyRef.current = true;
+        setActForm(function(prev) { return Object.assign({}, prev, patch); });
+      };
+      const updateEval = function(g, patch) {
+        formDirtyRef.current = true;
+        setActForm(function(prev) {
+          const evs = Object.assign({}, prev.evals || {});
+          evs[String(g)] = Object.assign({ stars: 0 }, evs[String(g)] || {}, patch);
+          return Object.assign({}, prev, { evals: evs });
+        });
+      };
+      // 1번: 역할별 활동 내용
+      const updateRoleDetail = function(key, v) {
+        formDirtyRef.current = true;
+        setActForm(function(prev) {
+          const d = Object.assign({}, prev.roleDetails || {}); d[key] = v;
+          return Object.assign({}, prev, { roleDetails: d });
+        });
+      };
+      // 2번: 공연 형태 여러 개 고르기 (다시 누르면 해제, 쓴 내용은 남겨 둠)
+      const togglePerfType = function(t) {
+        formDirtyRef.current = true;
+        setActForm(function(prev) {
+          const list = (prev.perfTypes || []).slice();
+          const i = list.indexOf(t);
+          if (i === -1) list.push(t); else list.splice(i, 1);
+          list.sort(function(a, b) { return PERF_TYPES.indexOf(a) - PERF_TYPES.indexOf(b); });
+          return Object.assign({}, prev, { perfTypes: list });
+        });
+      };
+      const updatePerfDetail = function(t, patch) {
+        formDirtyRef.current = true;
+        setActForm(function(prev) {
+          const d = Object.assign({}, prev.perfDetails || {});
+          d[t] = Object.assign({ what: '', process: '' }, d[t] || {}, patch);
+          return Object.assign({}, prev, { perfDetails: d });
+        });
+      };
+      // 3번: 모둠원 체크 (체크 해제하면 이유도 지움)
+      const togglePeer = function(name) {
+        formDirtyRef.current = true;
+        setActForm(function(prev) {
+          const pc = Object.assign({}, prev.peerChecks || {});
+          if (Object.prototype.hasOwnProperty.call(pc, name)) delete pc[name]; else pc[name] = '';
+          return Object.assign({}, prev, { peerChecks: pc });
+        });
+      };
+      const updatePeerReason = function(name, v) {
+        formDirtyRef.current = true;
+        setActForm(function(prev) {
+          const pc = Object.assign({}, prev.peerChecks || {}); pc[name] = v;
+          return Object.assign({}, prev, { peerChecks: pc });
+        });
+      };
+      // 내 조 친구 이름 (선생님이 적은 조원 이름에서 내 이름 빼기)
+      const groupMateNames = function(c, g) {
+        if (!c || !g) return [];
+        const me = currentUser && currentUser.role === 'student' ? String(currentUser.name || '').trim() : '';
+        return splitMembers((groupInfo[groupKey(c, g)] || {}).members).filter(function(n) { return n !== me; });
+      };
+
+      // 최종 제출 전에 빠진 것 찾기 (없으면 null)
+      const findMissing = function(f) {
+        if (!f.classNo || !f.groupNo) return '맨 위에서 내 반과 조를 먼저 골라 주세요.';
+        const r = f.roles || {};
+        for (let i = 0; i < ROLES.length; i++) {
+          if (r[ROLES[i].key] && !tlen((f.roleDetails || {})[ROLES[i].key])) return '1번: [' + ROLES[i].label + '] 역할에서 한 활동 내용을 적어 주세요.';
+        }
+        if (!(f.perfTypes || []).length) return '2번: 공연 형태를 하나 이상 골라 주세요.';
+        if (f.perfTypes.indexOf(PERF_ETC) !== -1 && !tlen(f.perfEtc)) return '2번: 기타 공연 형태가 무엇인지 적어 주세요.';
+        const pl = perfTextLength(f);
+        if (pl < PERF_MIN_LEN) return '2번: 개인 활동 내용을 모두 더해 ' + PERF_MIN_LEN + '자 이상 써 주세요. (지금 ' + pl + '자)';
+        const names = Object.keys(f.peerChecks || {});
+        for (let i = 0; i < names.length; i++) {
+          if (!tlen(f.peerChecks[names[i]])) return '3번: ' + names[i] + ' 친구를 고른 이유를 적어 주세요. (해당 없으면 체크를 풀어 주세요)';
+        }
+        const others = otherGroups(f.groupNo);
+        for (let i = 0; i < others.length; i++) {
+          const ev = (f.evals || {})[String(others[i])] || {};
+          if (!ev.stars) return '4번: ' + others[i] + '조 공연의 별점을 골라 주세요.';
+          const el = evalTextLength(ev);
+          if (el < EVAL_MIN_LEN) return '4번: ' + others[i] + '조 평가를 4칸 모두 더해 ' + EVAL_MIN_LEN + '자 이상 써 주세요. (지금 ' + el + '자)';
+        }
+        return null;
+      };
+
+      const saveAct = async function(isSubmit) {
+        if (!currentUser) return;
+        if (currentUser.role !== 'student') { showToast('교사 미리보기 화면에서는 저장되지 않습니다.'); return; }
+        if (saveBusy) return;
+        // 한 번 정해진 반·조는 학생이 바꿀 수 없음 (저장된 값을 그대로 씀)
+        const saved = allSubmissions[currentUser.id] || {};
+        const f = Object.assign({}, actForm, {
+          classNo: saved.classNo || actForm.classNo,
+          groupNo: saved.groupNo || actForm.groupNo
+        });
+        const firstPlace = !saved.classNo || !saved.groupNo;
+        if (isSubmit) {
+          const miss = findMissing(f);
+          if (miss) { showToast(miss, 5000); return; }
+        } else if (!f.classNo || !f.groupNo) {
+          showToast('맨 위에서 내 반과 조를 먼저 골라 주세요.', 4000);
+          return;
+        }
+        if (firstPlace && f.classNo && f.groupNo &&
+            !window.confirm('2학년 ' + f.classNo + '반 ' + f.groupNo + '조가 맞나요?\n한 번 저장하면 반과 조를 바꿀 수 없어요. (잘못 골랐다면 선생님께 말씀드려야 해요)')) return;
+        setSaveBusy(true);
+        try {
+          const blocked = await studentEditBlocked();
+          if (blocked) {
+            showToast(lockMessage(blocked) + ' 지금 작성한 내용은 반영되지 않습니다.', 7000);
+            formDirtyRef.current = false;
+            return;
+          }
+          const id = currentUser.id;
+          const sData = allSubmissions[id] || { studentId: id, studentName: currentUser.name, reports: {} };
+          const evals = {};
+          otherGroups(f.groupNo).forEach(function(g) {
+            const ev = (f.evals || {})[String(g)];
+            if (evalHasContent(ev)) {
+              const keep = { stars: ev.stars || 0 };
+              EVAL_FIELDS.forEach(function(x) { keep[x.key] = ev[x.key] || ''; });
+              evals[String(g)] = keep;
+            }
+          });
+          const r = f.roles || {};
+          const roleDetails = {};
+          ROLES.forEach(function(x) { if (r[x.key]) roleDetails[x.key] = (f.roleDetails || {})[x.key] || ''; });
+          const perfTypes = (f.perfTypes || []).slice();
+          const perfDetails = {};
+          perfTypes.forEach(function(t) {
+            const d = (f.perfDetails || {})[t] || {};
+            perfDetails[t] = { what: d.what || '', process: d.process || '' };
+          });
+          // 고른 조의 조원 명단에 있는 이름만 남김 (조를 바꾼 경우)
+          const mates = groupMateNames(f.classNo, f.groupNo);
+          const peerChecks = {};
+          Object.keys(f.peerChecks || {}).forEach(function(n) {
+            if (!mates.length || mates.indexOf(n) !== -1) peerChecks[n] = f.peerChecks[n] || '';
+          });
+          const act = {
+            roles: { lead: !!r.lead, cuesheet: !!r.cuesheet, editor: !!r.editor },
+            roleDetails: roleDetails,
+            perfTypes: perfTypes,
+            perfEtc: perfTypes.indexOf(PERF_ETC) !== -1 ? (f.perfEtc || '') : '',
+            perfDetails: perfDetails,
+            difficulty: f.difficulty || '',
+            episode: f.episode || '',
+            completion: f.completion || '',
+            peerChecks: peerChecks,
+            peerIssue: f.peerIssue || '',
+            evals: evals,
+            isSubmitted: !!isSubmit,
+            updatedAt: new Date().toLocaleString('ko-KR')
+          };
+          const fullData = Object.assign({}, sData, {
+            studentId: id, studentName: sData.studentName || currentUser.name,
+            classNo: Number(f.classNo), groupNo: Number(f.groupNo),
+            reports: Object.assign({}, sData.reports || {}, { act: act })
+          });
+
+          // 1) 먼저 이 기기에 저장 (서버가 느려도 학생이 기다리지 않도록)
+          const upLocal = Object.assign({}, allSubmissions, { [id]: fullData });
+          if (!safeSetLocal('perf_submissions', JSON.stringify(upLocal))) {
+            showToast('기기 저장 공간이 부족합니다. 브라우저의 다른 사이트 데이터를 정리한 뒤 다시 저장해 주세요.', 6000);
+            return;
+          }
+          formDirtyRef.current = false;
+          setAllSubmissions(upLocal);
+          addPendingSync(id);
+          const offlineMsg = isSubmit
+            ? '최종 제출로 이 기기에 저장했습니다. 서버가 돌아오면 선생님께 자동 전달됩니다. 📦'
+            : '이 기기에 임시 저장했습니다. 서버가 돌아오면 자동으로 전달됩니다. 💾';
+          if (!cloudReady()) { showToast(offlineMsg, 5000); return; }
+
+          // 2) 서버로 전송
+          showToast('이 기기에 저장했어요. 선생님께 전송하는 중…', 30000);
+          const stillExists = await verifyStudentStillExists(currentUser);
+          if (!stillExists) return;
+
+          // 서버의 최신 채점 결과를 덮어쓰지 않도록 가져와 유지
+          try {
+            const res = await withTimeout(supabaseClient.from('submissions').select('grading:data->grading').eq('student_id', String(id)).maybeSingle(), SERVER_CHECK_MS);
+            if (isNetworkFailure(res)) {
+              markOffline();
+            } else if (res.error) {
+              const res2 = await withTimeout(supabaseClient.from('submissions').select('data').eq('student_id', String(id)).maybeSingle(), SERVER_CHECK_MS);
+              if (isNetworkFailure(res2)) markOffline();
+              else if (res2.data && res2.data.data && res2.data.data.grading) fullData.grading = res2.data.data.grading;
+            } else if (res.data && res.data.grading) {
+              fullData.grading = res.data.grading;
+            } else {
+              delete fullData.grading;
+            }
+          } catch (err) {
+            if (isNetworkFailure(err)) markOffline();
+          }
+
+          const sent = await syncStudentToCloud(id, fullData);
+          const why = sent ? null : lockReasonAfterFailedSync();
+          if (why) {
+            removePendingSync(id);
+            fetchSubmissionsFromCloud({ role: 'student', id: id });
+            showToast(lockMessage(why) + ' 방금 작성한 내용은 반영되지 않았습니다.', 7000);
+            return;
+          }
+          if (sent) {
+            removePendingSync(id);
+            putLocalSub(id, fullData);
+            if (Number(saved.classNo || 0) !== Number(fullData.classNo)) await fetchGroupInfo(currentUser, fullData.classNo);
+            fetchMyGroupScores(fullData.classNo, fullData.groupNo);
+            showToast(isSubmit ? '최종 제출되었습니다! 선생님 화면에 바로 보입니다. 🎉' : '임시 저장되었습니다. (클라우드 저장 완료) 💾', 4000);
+          } else {
+            showToast(offlineMsg, 5000);
+          }
+        } finally {
+          setSaveBusy(false);
+        }
+      };
+
+      // =========================================================
+      // [교사] 채점·모둠 점수·확정
+      // =========================================================
+      const resetAllData = async function() {
+        if (!cloudReady()) { showToast(SERVER_DOWN_MSG, 6000); return; }
+        const c = prompt('모든 학생 계정(학번/비밀번호), 활동 기록, 모둠 정보(공연 제목·영상 링크·모둠 점수)를 완전히 삭제하시겠습니까?\n진행하시려면 "RESET"을 입력하세요.');
+        if (c !== 'RESET') return;
+        let failed = false;
+        try {
+          const r1 = await withTimeout(supabaseClient.from('submissions').delete().neq('student_id', '_empty_'));
+          const r2 = await withTimeout(supabaseClient.from('students').delete().neq('student_id', '_empty_'));
+          const r3 = await withTimeout(supabaseClient.from('group_info').delete().gte('class_no', 0));
+          failed = !!(r1.error || r2.error || r3.error);
+        } catch (err) {
+          console.error('Cloud Reset Error:', err);
+          failed = true;
+        }
+        try {
+          localStorage.removeItem('perf_submissions');
+          localStorage.removeItem('perf_student_accounts');
+          localStorage.removeItem('perf_group_info');
+          localStorage.removeItem('perf_pending_sync');
+        } catch (err) {}
+        setAllSubmissions({});
+        setGroupInfo({});
+        groupInfoRef.current = {};
+        setGroupDrafts({});
+        showToast(failed ? '일부 데이터를 서버에서 지우지 못했습니다. [새로고침] 후 다시 시도해 주세요.' : '모든 데이터가 초기화되었습니다. 🔄', 5000);
+        fetchSubmissionsFromCloud();
+      };
+
+      // 서버에서 한 학생 기록 읽기 (없으면 null, 연결 실패면 'offline')
+      const readSubFromCloud = async function(studentId) {
+        try {
+          const res = await withTimeout(supabaseClient.from('submissions').select('data').eq('student_id', String(studentId)).maybeSingle(), SERVER_CHECK_MS);
+          if (isNetworkFailure(res)) { markOffline(); return 'offline'; }
+          if (res.error) return null;
+          return (res.data && res.data.data) || null;
+        } catch (err) {
+          if (isNetworkFailure(err)) { markOffline(); return 'offline'; }
+          return null;
+        }
+      };
+
+      // 모둠 정보 저장 (patch: title, video_url, members, plan_score, perform_score 중 일부). 성공하면 저장된 행
+      const lastGroupErrorRef = useRef(null);
+      // 저장 실패 이유를 선생님이 알 수 있게 안내
+      const groupErrorText = function() {
+        const er = lastGroupErrorRef.current;
+        if (!er) return '잠시 후 다시 시도해 주세요.';
+        const msg = String(er.message || '');
+        if (er.code === 'PGRST205' || er.code === '42P01' || /group_info/.test(msg) && /schema cache|does not exist/.test(msg)) return '서버에 모둠 정보 표(group_info)가 없습니다. 통합 SQL을 실행했는지 확인해 주세요.';
+        if (er.code === '42501' || /permission denied|row-level security/i.test(msg)) return '서버에서 모둠 정보 표에 쓸 권한이 없습니다. 안내된 권한 SQL을 실행해 주세요.';
+        return '(' + (er.code ? er.code + ': ' : '') + msg + ')';
+      };
+      const saveGroupRow = async function(c, g, patch) {
+        const cur = groupInfoRef.current[groupKey(c, g)] || {};
+        const row = {
+          class_no: Number(c), group_no: Number(g),
+          title: cur.title || '', video_url: cur.video_url || '', members: cur.members || '',
+          plan_score: isNum(cur.plan_score) ? cur.plan_score : null,
+          perform_score: isNum(cur.perform_score) ? cur.perform_score : null,
+          updated_at: new Date().toISOString()
+        };
+        Object.assign(row, patch);
+        const res = await withTimeout(supabaseClient.from('group_info').upsert(row, { onConflict: 'class_no,group_no' }), SERVER_CHECK_MS);
+        if (res.error) {
+          if (isNetworkFailure(res)) markOffline();
+          lastGroupErrorRef.current = res.error;
+          console.error('group_info save error:', res.error);
+          return null;
+        }
+        lastGroupErrorRef.current = null;
+        mergeGroupRows([row]);
+        return row;
+      };
+
+      // 모둠 점수가 바뀌면, 확정된 조원 중 확정 점수와 달라진 학생의 확정을 풀어 줌. 풀린 학생 이름 목록
+      const releaseGroupConfirmations = async function(c, g, exceptId) {
+        const released = [];
+        const ids = Object.keys(allSubmissions).filter(function(id) {
+          const s = allSubmissions[id];
+          return id !== exceptId && s && Number(s.classNo) === Number(c) && Number(s.groupNo) === Number(g) && getConfirmed(s);
+        });
+        for (let i = 0; i < ids.length; i++) {
+          const t = await readSubFromCloud(ids[i]);
+          if (!t || t === 'offline' || !getConfirmed(t)) continue;
+          if (Number(t.classNo) !== Number(c) || Number(t.groupNo) !== Number(g)) continue;
+          if (!snapshotDiffers(t.grading.confirmed, computeScores(t, groupInfoRef.current))) continue;
+          const grading = Object.assign({}, t.grading);
+          delete grading.confirmed;
+          const updated = Object.assign({}, t, { grading: grading });
+          if (await syncStudentToCloud(ids[i], updated)) {
+            putLocalSub(ids[i], updated);
+            released.push(t.studentName || ids[i]);
+          }
+        }
+        return released;
+      };
+
+      const scoreVal = function(v) { return v === '' || v === null || v === undefined ? null : Number(v); };
+
+      const openGrading = function(s) {
+        const gi = groupInfo[groupKey(s.classNo, s.groupNo)] || {};
+        const ind = (s.grading && s.grading.ind) || {};
+        const v = function(x) { return isNum(x) ? String(x) : ''; };
+        setGradingForm({
+          plan: v(gi.plan_score), perform: v(gi.perform_score),
+          participation: v(ind.participation), review: v(ind.review),
+          comment: ind.comment || '', teacherFeedback: (s.grading && s.grading.teacherFeedback) || ''
+        });
+        setGradingStudentId(s.studentId);
+      };
+
+      const saveGrading = async function(studentId) {
+        if (!studentId || gradingBusy) return;
+        if (!cloudReady()) { showToast('서버 응답이 없어 채점을 저장할 수 없습니다. 창을 닫지 말고 서버가 돌아오면 다시 저장해 주세요.', 6000); return; }
+        setGradingBusy(true);
+        try {
+          const target = await readSubFromCloud(studentId);
+          if (target === 'offline') { showToast(SERVER_DOWN_MSG, 6000); return; }
+          if (!target) { showToast('학생 기록을 찾지 못했습니다. [새로고침]을 누른 뒤 다시 시도해 주세요.'); return; }
+          const name = target.studentName || studentId;
+          const nowStr = new Date().toLocaleString('ko-KR');
+          const notes = [];
+
+          // 1) 모둠 점수 (조원 모두에게 적용)
+          const c = target.classNo, g = target.groupNo;
+          const plan = scoreVal(gradingForm.plan), perform = scoreVal(gradingForm.perform);
+          if (c && g) {
+            const gi = groupInfoRef.current[groupKey(c, g)] || {};
+            const curPlan = isNum(gi.plan_score) ? gi.plan_score : null;
+            const curPerform = isNum(gi.perform_score) ? gi.perform_score : null;
+            if (plan !== curPlan || perform !== curPerform) {
+              const row = await saveGroupRow(c, g, { plan_score: plan, perform_score: perform });
+              if (!row) { showToast('모둠 점수를 저장하지 못했습니다. ' + groupErrorText(), 9000); return; }
+              const members = Object.keys(allSubmissions).filter(function(id) { const s = allSubmissions[id]; return s && Number(s.classNo) === Number(c) && Number(s.groupNo) === Number(g); }).length;
+              notes.push(c + '반 ' + g + '조 모둠 점수 저장 (조원 ' + Math.max(members, 1) + '명에게 적용)');
+              const rel = await releaseGroupConfirmations(c, g, studentId);
+              if (rel.length) notes.push('모둠 점수가 바뀌어 ' + rel.join(', ') + ' 학생의 확정이 해제됨');
+            }
+          }
+
+          // 2) 개인 점수
+          const prevGrading = target.grading || {};
+          const act = target.reports && target.reports.act;
+          const participation = scoreVal(gradingForm.participation), review = scoreVal(gradingForm.review);
+          const comment = (gradingForm.comment || '').trim();
+          let ind = prevGrading.ind || null;
+          if (participation !== null || review !== null || comment) {
+            ind = {
+              participation: participation, review: review, comment: comment,
+              reportVersion: act ? act.updatedAt : null,
+              gradedAt: nowStr
+            };
+          } else {
+            ind = null;
+          }
+          const grading = Object.assign({}, prevGrading, {
+            ind: ind || undefined,
+            teacherFeedback: gradingForm.teacherFeedback || '',
+            gradedAt: nowStr
+          });
+          if (!ind) delete grading.ind;
+
+          // 3) 확정 유지 여부: 확정 때와 점수가 달라지면 확정을 풀어 다시 확정하게 함
+          let released = false;
+          if (grading.confirmed) {
+            const after = computeScores(Object.assign({}, target, { grading: grading }), groupInfoRef.current);
+            if (snapshotDiffers(grading.confirmed, after)) { delete grading.confirmed; released = true; }
+          }
+          const updated = Object.assign({}, target, { grading: grading });
+          const ok = await syncStudentToCloud(studentId, updated);
+          if (!ok) { showToast('채점을 저장하지 못했습니다. 창을 닫지 말고 잠시 후 다시 저장해 주세요.', 6000); return; }
+          putLocalSub(studentId, updated);
+          setGradingStudentId(null);
+          const sc = computeScores(updated, groupInfoRef.current);
+          showToast(name + ' 학생 채점 저장 (총점 ' + sc.total + ' / ' + TOTAL_MAX + '점) 🌟' +
+            (notes.length ? ' · ' + notes.join(' · ') : '') +
+            (released ? ' · 점수가 바뀌어 이 학생의 확정이 해제되었습니다. 다시 [확정하기]를 눌러 주세요.' : ''), notes.length || released ? 8000 : 3500);
+        } finally {
+          setGradingBusy(false);
+        }
+      };
+
+      // [교사] 점수 확정하기 / 확정 취소
+      const setStudentConfirmed = async function(studentId, makeConfirmed) {
+        if (!cloudReady()) { showToast(SERVER_DOWN_MSG, 6000); return; }
+        const target = await readSubFromCloud(studentId);
+        if (target === 'offline') { showToast(SERVER_DOWN_MSG, 6000); return; }
+        if (!target) { showToast('학생 기록을 찾지 못했습니다. [새로고침]을 누른 뒤 다시 시도해 주세요.'); return; }
+        const name = target.studentName || studentId;
+        const grading = Object.assign({}, target.grading || {});
+
+        if (makeConfirmed) {
+          if (target.classNo && target.groupNo) await fetchGroupInfo(currentUserRef.current);
+          const sc = computeScores(target, groupInfoRef.current);
+          if (!sc.any) { showToast('채점된 점수가 없어 확정할 수 없습니다. 먼저 채점해 주세요.', 5000); return; }
+          const line = function(it) { return it.label + ': ' + (sc[it.key] === null ? '채점 전 (0점으로 확정됨)' : sc[it.key] + ' / ' + it.max); };
+          const st = getActStatus(target);
+          const msg = name + ' 학생의 점수를 확정할까요?\n\n' +
+            SCORE_ITEMS.map(line).join('\n') + '\n합계: ' + sc.total + ' / ' + TOTAL_MAX + '점\n\n' +
+            (!sc.complete ? '⚠ 아직 채점하지 않은 항목이 있어요.\n\n' : '') +
+            (st.kind === 'resubmitted' ? '⚠ 학생이 채점 뒤에 활동 기록을 다시 제출했어요.\n\n' : '') +
+            '확정하면 학생에게 최종 점수로 보이고, 학생은 더 이상 활동 기록을 고칠 수 없습니다.';
+          if (!window.confirm(msg)) return;
+          grading.confirmed = { plan: sc.plan, perform: sc.perform, participation: sc.participation, review: sc.review, total: sc.total, at: new Date().toLocaleString('ko-KR') };
+        } else {
+          if (!window.confirm(name + ' 학생의 점수 확정을 취소할까요?\n학생 화면의 "최종 점수" 표시가 사라지고, 마감 전이라면 학생이 다시 활동 기록을 고칠 수 있습니다.')) return;
+          delete grading.confirmed;
+        }
+
+        const updated = Object.assign({}, target, { grading: grading });
+        const ok = await syncStudentToCloud(studentId, updated);
+        if (!ok) { showToast('저장하지 못했습니다. 잠시 후 다시 시도해 주세요.', 5000); return; }
+        putLocalSub(studentId, updated);
+        showToast(makeConfirmed
+          ? name + ' 학생의 점수를 확정했습니다. (최종 ' + grading.confirmed.total + ' / ' + TOTAL_MAX + '점) ✅'
+          : name + ' 학생의 점수 확정을 취소했습니다.', 5000);
+      };
+
+      // [교사] 모둠 관리: 공연 제목·영상 링크·조원·모둠 점수 저장
+      const getGroupDraft = function(c, g) {
+        const k = groupKey(c, g);
+        if (groupDrafts[k]) return groupDrafts[k];
+        const gi = groupInfo[k] || {};
+        return {
+          title: gi.title || '', video_url: gi.video_url || '', members: gi.members || '',
+          plan: isNum(gi.plan_score) ? String(gi.plan_score) : '', perform: isNum(gi.perform_score) ? String(gi.perform_score) : ''
+        };
+      };
+      const setGroupDraft = function(c, g, patch) {
+        const k = groupKey(c, g);
+        setGroupDrafts(function(prev) {
+          return Object.assign({}, prev, { [k]: Object.assign({}, prev[k] || getGroupDraft(c, g), patch) });
+        });
+      };
+      const saveGroupCard = async function(c, g) {
+        const k = groupKey(c, g);
+        if (groupBusy) return;
+        if (!cloudReady()) { showToast(SERVER_DOWN_MSG, 6000); return; }
+        const d = getGroupDraft(c, g);
+        const url = (d.video_url || '').trim();
+        if (url && !/^https?:\/\//i.test(url)) { showToast('영상 링크는 https:// 로 시작하는 주소를 붙여 넣어 주세요.', 5000); return; }
+        setGroupBusy(k);
+        try {
+          const gi = groupInfoRef.current[k] || {};
+          const plan = scoreVal(d.plan), perform = scoreVal(d.perform);
+          const scoreChanged = plan !== (isNum(gi.plan_score) ? gi.plan_score : null) || perform !== (isNum(gi.perform_score) ? gi.perform_score : null);
+          const row = await saveGroupRow(c, g, { title: (d.title || '').trim(), video_url: url, members: (d.members || '').trim(), plan_score: plan, perform_score: perform });
+          if (!row) { showToast('저장하지 못했습니다. ' + groupErrorText(), 9000); return; }
+          setGroupDrafts(function(prev) { const up = Object.assign({}, prev); delete up[k]; return up; });
+          let rel = [];
+          if (scoreChanged) rel = await releaseGroupConfirmations(c, g, null);
+          showToast(c + '반 ' + g + '조 정보를 저장했습니다.' + (rel.length ? ' 모둠 점수가 바뀌어 ' + rel.join(', ') + ' 학생의 확정이 해제되었습니다.' : ''), rel.length ? 7000 : 3000);
+        } finally {
+          setGroupBusy('');
+        }
+      };
+
+      // [교사] 학생 정보 수정 (학번·성명·반·조)
+      const saveStudentInfoEdit = async function(ev) {
+        ev.preventDefault();
+        if (!cloudReady()) { showToast(SERVER_DOWN_MSG, 6000); return; }
+        if (!editingStudentTargetId) return;
+        const oldId = editingStudentTargetId;
+        const newId = editingStudentForm.id.trim();
+        const newName = editingStudentForm.name.trim();
+        const newClass = editingStudentForm.classNo ? Number(editingStudentForm.classNo) : null;
+        const newGroup = editingStudentForm.groupNo ? Number(editingStudentForm.groupNo) : null;
+        if (!ID_RULE.test(newId)) { showToast('학번은 숫자 4~5자리로 입력해 주세요.'); return; }
+        if (!newName) { showToast('성명을 입력해 주세요.'); return; }
+
+        let currentPw = '0000';
+        try {
+          const oldAcc = await cloudGetAccount(oldId);
+          if (oldAcc.error) { showAccountError(oldAcc.error); return; }
+          if (oldAcc.data) currentPw = oldAcc.data.pw;
+          if (oldId !== newId) {
+            const dup = await cloudGetAccount(newId);
+            if (dup.data || allSubmissions[newId]) { showToast('변경하려는 학번(' + newId + ')이 이미 존재합니다.'); return; }
+          }
+        } catch (err) {
+          showAccountError(err);
+          return;
+        }
+
+        const cur = await readSubFromCloud(oldId);
+        if (cur === 'offline') { showToast(SERVER_DOWN_MSG, 6000); return; }
+        const base = cur || allSubmissions[oldId] || { studentId: oldId, studentName: newName, reports: {} };
+        const updated = Object.assign({}, base, { studentId: newId, studentName: newName });
+        if (newClass) updated.classNo = newClass; else delete updated.classNo;
+        if (newGroup) updated.groupNo = newGroup; else delete updated.groupNo;
+        let releasedNote = '';
+        if (getConfirmed(updated) && (Number(base.classNo) !== Number(updated.classNo) || Number(base.groupNo) !== Number(updated.groupNo))) {
+          if (snapshotDiffers(updated.grading.confirmed, computeScores(updated, groupInfoRef.current))) {
+            updated.grading = Object.assign({}, updated.grading);
+            delete updated.grading.confirmed;
+            releasedNote = ' 모둠이 바뀌어 모둠 점수가 달라졌으므로 확정이 해제되었습니다.';
+          }
+        }
+
+        try {
+          const accRes = await withTimeout(supabaseClient.from('students').upsert({ student_id: String(newId), name: newName, pw: currentPw }, { onConflict: 'student_id' }));
+          if (accRes.error) { showAccountError(accRes.error); return; }
+          let ok;
+          if (oldId !== newId && cur) {
+            // 학번 변경: 기존 줄을 새 학번으로 옮김 (활동 기록은 그대로라 마감 뒤에도 가능)
+            const mv = await withTimeout(supabaseClient.from('submissions').update({ student_id: String(newId), data: updated, updated_at: new Date().toISOString() }).eq('student_id', String(oldId)));
+            ok = !mv.error;
+          } else {
+            ok = await syncStudentToCloud(newId, updated);
+          }
+          if (!ok) { showToast('학생 정보를 저장하지 못했습니다. 잠시 후 다시 시도해 주세요.', 5000); return; }
+          if (oldId !== newId) {
+            await withTimeout(supabaseClient.from('submissions').delete().eq('student_id', String(oldId)));
+            await withTimeout(supabaseClient.from('students').delete().eq('student_id', String(oldId)));
+          }
+        } catch (err) {
+          console.error('Student Edit Cloud Error:', err);
+          showToast(SERVER_DOWN_MSG, 6000);
+          return;
+        }
+
+        const accs = getStudentAccounts();
+        if (accs[oldId]) { delete accs[oldId]; safeSetLocal('perf_student_accounts', JSON.stringify(accs)); }
+        setAllSubmissions(function(prev) {
+          const up = Object.assign({}, prev);
+          delete up[oldId];
+          up[newId] = updated;
+          safeSetLocal('perf_submissions', JSON.stringify(up));
+          return up;
+        });
+        setEditingStudentModal(false);
+        setEditingStudentTargetId(null);
+        showToast(newName + ' 학생 정보가 수정되었습니다. ✏️' + releasedNote, releasedNote ? 7000 : 3000);
+      };
+
+      // [교사] 학생 한 명 기록 영구 삭제
+      const deleteSingleStudent = async function() {
+        if (!editingStudentTargetId) return;
+        if (!cloudReady()) { showToast(SERVER_DOWN_MSG, 6000); return; }
+        const target = allSubmissions[editingStudentTargetId];
+        const sName = (target && target.studentName) || editingStudentTargetId;
+        const c = prompt(
+          '정말로 ' + sName + ' (' + editingStudentTargetId + ') 학생의 모든 데이터(계정, 활동 기록, 다른 모둠 평가, 채점 내역)를 삭제하시겠습니까?\n' +
+          '삭제하려면 "삭제"라고 입력하세요.'
+        );
+        if (c !== '삭제') { showToast('삭제가 취소되었습니다.'); return; }
+        const targetId = editingStudentTargetId;
+        let cloudFailed = false;
+        try {
+          // 기록을 먼저 지운 뒤 계정을 지움 (학생 기기에서 계정이 다시 옮겨지는 일을 막기 위한 순서)
+          const r1 = await withTimeout(supabaseClient.from('submissions').delete().eq('student_id', String(targetId)));
+          const r2 = await withTimeout(supabaseClient.from('students').delete().eq('student_id', String(targetId)));
+          cloudFailed = !!(r1.error || r2.error);
+        } catch(err) {
+          console.error('Student Delete Cloud Error:', err);
+          cloudFailed = true;
+        }
+        if (cloudFailed) { showToast('서버에서 삭제하지 못했습니다. 잠시 후 다시 시도해 주세요.', 5000); return; }
+        purgeLocalStudent(targetId);
+        setEditingStudentModal(false);
+        setEditingStudentTargetId(null);
+        showToast(sName + ' 학생의 계정과 기록이 모두 삭제되었습니다. 🗑️');
+      };
+
+      // [엑셀 다운로드] 서버의 최신 기록으로 4개 시트를 담은 .xlsx 파일 만들기
+      const [excelBusy, setExcelBusy] = useState(false);
+      const downloadExcel = async function() {
+        if (excelBusy) return;
+        setExcelBusy(true);
+        let source = null;
+        let groups = groupInfoRef.current;
+        try {
+          if (cloudReady()) {
+            const res = await withTimeout(supabaseClient.from('submissions').select('student_id, data'));
+            if (!res.error && res.data) {
+              source = {};
+              res.data.forEach(function(row) { if (row.student_id && row.data) source[row.student_id] = row.data; });
+            } else if (isNetworkFailure(res)) {
+              markOffline();
+            }
+            const gr = await withTimeout(supabaseClient.from('group_info').select('class_no, group_no, title, video_url, members, plan_score, perform_score'));
+            if (!gr.error && gr.data) {
+              groups = {};
+              gr.data.forEach(function(r) { groups[groupKey(r.class_no, r.group_no)] = r; });
+              mergeGroupRows(gr.data);
+            }
+          }
+        } catch (err) {
+          if (isNetworkFailure(err)) markOffline();
+        }
+        try {
+          const bytes = buildXlsxBytes(buildGradeWorkbook(source || allSubmissions, groups));
+          const blob = new Blob([bytes], { type: 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet' });
+          const url = URL.createObjectURL(blob);
+          const a = document.createElement('a');
+          a.href = url;
+          a.download = '송악고_공연평가_' + new Date().toLocaleDateString('ko-KR').replace(/\.\s?/g, '-').replace(/-$/, '') + '.xlsx';
+          document.body.appendChild(a);
+          a.click();
+          a.remove();
+          setTimeout(function() { URL.revokeObjectURL(url); }, 2000);
+          showToast(source
+            ? '엑셀 파일을 다운로드했습니다. (요약 · 활동 기록 · 상호평가 · 모둠별 요약, 노란 칸은 제출하지 않은 작성 중 내용) 📊'
+            : '서버 응답이 없어 지금 화면에 있는 기록으로 엑셀 파일을 만들었습니다.', 6000);
+        } catch (err) {
+          console.error('Excel Export Error:', err);
+          showToast('엑셀 파일을 만들지 못했습니다. 잠시 후 다시 시도해 주세요.', 5000);
+        } finally {
+          setExcelBusy(false);
+        }
+      };
+
+      // [점수 확정] 로그인(또는 페이지를 연) 직후 서버에서 내 기록을 받아 온 시점에 한 번만 팝업 판단
+      const finalPopupPendingRef = useRef(!!(currentUser && currentUser.role === 'student'));
+      useEffect(function() {
+        if (!currentUser || currentUser.role !== 'student') { setShowFinalPopup(false); return; }
+        if (!finalPopupPendingRef.current || !studentCloudLoaded) return;
+        finalPopupPendingRef.current = false;
+        if (getConfirmed(allSubmissions[currentUser.id])) setShowFinalPopup(true);
+      }, [studentCloudLoaded, allSubmissions, currentUser]);
+
+      // 등록 화면에서 반을 고르면 그 반의 공연 제목·조원 이름만 받아 옴
+      useEffect(function() {
+        if (!isRegisterMode || !registerClass || !cloudReady()) { setRegGroups([]); return; }
+        let alive = true;
+        withTimeout(supabaseClient.from('group_info').select('class_no, group_no, title, members').eq('class_no', Number(registerClass)), SERVER_CHECK_MS)
+          .then(function(res) { if (alive && !res.error && res.data) setRegGroups(res.data); })
+          .catch(function() {});
+        return function() { alive = false; };
+      }, [isRegisterMode, registerClass, serverStatus]);
+
+      const closedNow = isPortalClosedNow(portal);
+      const myConfirmed = myId ? getConfirmed(mySub) : null;
+      const studentLocked = !!(myId && (closedNow || myConfirmed));
+
+      // ---------------------------------------------------------
+      // 화면 그리기 도우미
+      // ---------------------------------------------------------
+      const sectionCard = function(num, title, desc, body, opts) {
+        const o = opts || {};
+        return e('section', { className: 'bg-white rounded-2xl border ' + (o.border || 'border-slate-200') + ' shadow-sm overflow-hidden' },
+          e('div', { className: 'px-4 sm:px-5 py-3 border-b border-slate-100 flex items-start justify-between gap-3 ' + (o.head || 'bg-slate-50') },
+            e('div', { className: 'flex items-start gap-2.5' },
+              e('span', { className: 'w-7 h-7 shrink-0 rounded-lg bg-violet-600 text-white text-sm font-black flex items-center justify-center' }, num),
+              e('div', null,
+                e('h3', { className: 'text-sm font-black text-slate-900' }, title),
+                desc && e('p', { className: 'text-2xs text-slate-500 mt-0.5 leading-relaxed' }, desc)
+              )
+            ),
+            o.badge && e('span', { className: 'text-2xs font-bold px-2 py-0.5 rounded-full whitespace-nowrap ' + (o.badgeClass || 'bg-slate-200 text-slate-700') }, o.badge)
+          ),
+          e('div', { className: 'p-4 sm:p-5 space-y-3' }, body)
+        );
+      };
+
+      const textArea = function(value, onChange, placeholder, rows, disabled) {
+        return e('textarea', {
+          value: value || '', rows: rows || 4, disabled: !!disabled, placeholder: placeholder,
+          onChange: function(ev) { onChange(ev.target.value); },
+          className: 'w-full p-3 border border-slate-300 rounded-xl text-sm leading-relaxed focus:outline-none focus:ring-2 focus:ring-violet-400 disabled:bg-slate-100'
+        });
+      };
+
+      const chip = function(key, label, active, onClick, sub) {
+        return e('button', {
+          key: key, type: 'button', onClick: onClick,
+          className: 'px-3 py-2 rounded-xl border text-xs font-bold transition text-left ' + (active ? 'bg-violet-600 border-violet-600 text-white shadow' : 'bg-white border-slate-300 text-slate-700 hover:border-violet-400')
+        }, e('span', { className: 'block' }, label), sub && e('span', { className: 'block text-2xs font-medium mt-0.5 ' + (active ? 'text-violet-100' : 'text-slate-400') }, sub));
+      };
+
+      // 반의 모둠 목록 (공연 제목·조원) — 학생이 자기 조를 찾을 때 참고
+      const renderClassGroupList = function(c, selectedGroup, onPick) {
+        return e('div', { className: 'grid grid-cols-1 sm:grid-cols-5 gap-2' },
+          GROUPS.map(function(g) {
+            const gi = groupInfo[groupKey(c, g)] || {};
+            const active = Number(selectedGroup) === g;
+            return e('button', {
+              key: g, type: 'button', onClick: onPick ? function() { onPick(g); } : undefined, disabled: !onPick,
+              className: 'p-3 rounded-xl border text-left transition ' + (active ? 'bg-violet-600 border-violet-600 text-white shadow' : 'bg-white border-slate-200 hover:border-violet-400') + (onPick ? '' : ' cursor-default')
+            },
+              e('p', { className: 'text-sm font-black' }, g + '조'),
+              e('p', { className: 'text-2xs font-bold mt-0.5 ' + (active ? 'text-violet-100' : 'text-slate-700') }, gi.title || '공연 제목 미등록'),
+              gi.members && e('p', { className: 'text-2xs mt-1 leading-snug ' + (active ? 'text-violet-100' : 'text-slate-400') }, gi.members)
+            );
+          })
+        );
+      };
+
+      // 학생 점수 카드
+      const renderStudentScore = function() {
+        if (!myId) return null;
+        const live = computeScores(mySub, groupInfo);
+        const conf = myConfirmed;
+        if (!conf && !live.any) return null;
+        const scores = conf ? { plan: conf.plan, perform: conf.perform, participation: conf.participation, review: conf.review, total: conf.total } : live;
+        const ind = (mySub && mySub.grading && mySub.grading.ind) || {};
+        return e('div', { className: 'rounded-2xl border-2 ' + (conf ? 'border-emerald-300 bg-emerald-50' : 'border-violet-200 bg-violet-50') + ' p-4 sm:p-5 space-y-3' },
+          e('div', { className: 'flex items-center justify-between gap-2 flex-wrap' },
+            e('div', { className: 'flex items-center gap-2' },
+              e('i', { className: 'fa-solid ' + (conf ? 'fa-medal text-emerald-600' : 'fa-clipboard-check text-violet-600') }),
+              e('h3', { className: 'text-sm font-black ' + (conf ? 'text-emerald-900' : 'text-violet-900') }, conf ? '최종 점수 (확정)' : '채점 결과')
+            ),
+            e('span', { className: 'text-2xs font-bold ' + (conf ? 'text-emerald-700' : 'text-violet-700') }, conf ? '확정: ' + conf.at : '선생님이 확정하기 전이라 바뀔 수 있어요')
+          ),
+          e(ScoreTable, { scores: scores, final: !!conf }),
+          ind.comment && e('div', { className: 'p-3 rounded-xl bg-white border border-slate-200 text-xs leading-relaxed' },
+            e('p', { className: 'font-bold text-slate-700 mb-1' }, e('i', { className: 'fa-solid fa-comment-dots text-violet-500 mr-1' }), '선생님 코멘트'),
+            e('p', { className: 'whitespace-pre-wrap text-slate-700' }, ind.comment)
+          )
+        );
+      };
+
+      // 학생 작성 화면
+      const renderStudentForm = function(isPreview) {
+        // 학생: 저장된 반·조는 고정 (교사 미리보기는 자유롭게 눌러 볼 수 있음)
+        const lockedClass = !isPreview && mySub && mySub.classNo ? Number(mySub.classNo) : null;
+        const lockedGroup = !isPreview && mySub && mySub.groupNo ? Number(mySub.groupNo) : null;
+        const f = Object.assign({}, actForm, lockedClass ? { classNo: lockedClass } : {}, lockedGroup ? { groupNo: lockedGroup } : {});
+        const myGroup = Number(f.groupNo) || null;
+        const myClass = Number(f.classNo) || null;
+        const alreadySubmitted = !isPreview && myAct && myAct.isSubmitted;
+        // 영상은 등록해서 반이 정해진(저장된) 학생에게, 자기 반 것만 보여 줌
+        const canSeeVideo = !!(isPreview || lockedClass);
+        const lockNote = function(key, text) {
+          return e('p', { key: key, className: 'text-2xs text-slate-500 flex items-center gap-1' }, e('i', { className: 'fa-solid fa-lock text-slate-400' }), text);
+        };
+        return e('div', { className: 'space-y-4' },
+          sectionCard('0', lockedGroup ? '내 반과 조' : (lockedClass ? '내 조 고르기' : '내 반과 조 고르기'),
+            lockedGroup ? '반과 조가 정해졌어요. 잘못되었다면 선생님께 말씀드려 주세요.'
+              : '몇 조인지 모르겠으면 아래 공연 제목과 조원 이름을 보고 찾으세요. 처음 저장할 때 정해지고, 그 뒤에는 바꿀 수 없어요.',
+            [
+              lockedClass
+                ? e('div', { key: 'c', className: 'space-y-1' },
+                    e('p', { className: 'text-sm font-black text-violet-800' }, '2학년 ' + lockedClass + '반' + (lockedGroup ? ' ' + lockedGroup + '조' : '')),
+                    lockNote('cl', lockedGroup ? '반과 조는 바꿀 수 없어요. (선생님만 바꿀 수 있어요)' : '반은 바꿀 수 없어요. (선생님만 바꿀 수 있어요)')
+                  )
+                : e('div', { key: 'c', className: 'space-y-1.5' },
+                    e('p', { className: 'text-xs font-bold text-slate-700' }, '반 (2학년)'),
+                    e('div', { className: 'flex flex-wrap gap-2' }, CLASSES.map(function(c) {
+                      return chip(c, c + '반', myClass === c, function() { updateForm({ classNo: c }); });
+                    }))
+                  ),
+              myClass && e('div', { key: 'g', className: 'space-y-1.5' },
+                e('p', { className: 'text-xs font-bold text-slate-700' }, myClass + '반 모둠 목록' + (lockedGroup ? '' : ' — 내 조를 눌러 주세요')),
+                renderClassGroupList(myClass, myGroup, lockedGroup ? null : function(g) { updateForm({ groupNo: g }); })
+              ),
+              !lockedGroup && myClass && myGroup && e('p', { key: 'ok', className: 'text-xs font-bold text-violet-700' }, e('i', { className: 'fa-solid fa-circle-check mr-1' }), '나는 ' + myClass + '반 ' + myGroup + '조입니다. (처음 저장할 때 정해져요)')
+            ],
+            { badge: lockedGroup ? '확정' : '필수', badgeClass: lockedGroup ? 'bg-emerald-100 text-emerald-800' : 'bg-violet-100 text-violet-800' }
+          ),
+
+          sectionCard('1', '모둠 내 특별 활동 작성 (해당자만)', '모둠에서 아래 역할을 맡았다면 고르고, 어떤 활동을 했는지 적어 주세요. 해당 없으면 넘어가도 됩니다.',
+            [
+              e('div', { key: 'r', className: 'grid grid-cols-1 sm:grid-cols-3 gap-2' },
+                ROLES.map(function(r) {
+                  const on = !!(f.roles && f.roles[r.key]);
+                  return chip(r.key, (on ? '☑ ' : '☐ ') + r.label, on, function() {
+                    const roles = Object.assign({}, f.roles || {});
+                    roles[r.key] = !on;
+                    updateForm({ roles: roles });
+                  }, r.desc);
+                })
+              )
+            ].concat(ROLES.filter(function(r) { return f.roles && f.roles[r.key]; }).map(function(r) {
+              return e('div', { key: 't-' + r.key },
+                e('p', { className: 'text-xs font-bold text-slate-700 mb-1' }, '[' + r.label + '] 역할에서 한 활동 내용'),
+                textArea((f.roleDetails || {})[r.key], function(v) { updateRoleDetail(r.key, v); }, r.example, 3)
+              );
+            })),
+            { badge: '해당자만', badgeClass: 'bg-slate-200 text-slate-600' }
+          ),
+
+          (function() {
+            const pl = perfTextLength(f);
+            const types = f.perfTypes || [];
+            return sectionCard('2', '개인 활동 내용 작성 (모두)', '내가 한 공연 형태를 모두 고르고(여러 개 가능), 형태마다 어떤 공연을 했는지와 준비 과정을 적어 주세요. 아래 칸까지 모두 더해 ' + PERF_MIN_LEN + '자 이상 써야 제출됩니다.',
+              [
+                e('div', { key: 'p', className: 'space-y-1.5' },
+                  e('p', { className: 'text-xs font-bold text-slate-700' }, '공연 형태 (여러 개 고를 수 있어요)'),
+                  e('div', { className: 'flex flex-wrap gap-2' }, PERF_TYPES.map(function(t) {
+                    const on = types.indexOf(t) !== -1;
+                    return chip(t, (on ? '☑ ' : '☐ ') + t, on, function() { togglePerfType(t); });
+                  }))
+                )
+              ].concat(types.map(function(t) {
+                const d = (f.perfDetails || {})[t] || {};
+                return e('div', { key: 'pt-' + t, className: 'p-3 rounded-xl border border-violet-200 bg-violet-50 space-y-2' },
+                  e('p', { className: 'text-sm font-black text-violet-800' }, t === PERF_ETC ? '기타 공연' : t),
+                  t === PERF_ETC && e('input', {
+                    type: 'text', value: f.perfEtc || '', placeholder: '어떤 형태인지 적어 주세요 (예: 개인 랩, 모둠 뮤지컬)',
+                    onChange: function(ev) { updateForm({ perfEtc: ev.target.value }); },
+                    className: 'w-full p-2.5 border border-slate-300 rounded-xl text-sm bg-white focus:outline-none focus:ring-2 focus:ring-violet-400'
+                  }),
+                  e('div', null,
+                    e('p', { className: 'text-xs font-bold text-slate-700 mb-1' }, '어떤 공연을 했나요?'),
+                    textArea(d.what, function(v) { updatePerfDetail(t, { what: v }); }, '예) 아이유의 「너의 의미」를 친구와 함께 2부 화음으로 불렀다.', 2)
+                  ),
+                  e('div', null,
+                    e('p', { className: 'text-xs font-bold text-slate-700 mb-1' }, '어떤 과정으로 준비했나요?'),
+                    textArea(d.process, function(v) { updatePerfDetail(t, { process: v }); }, '예) 곡 고르기 → 파트 나누기 → 점심시간마다 연습 → 녹음해서 들어 보며 고치기', 3)
+                  )
+                );
+              })).concat(REFLECT_FIELDS.map(function(fl) {
+                return e('div', { key: fl.key },
+                  e('p', { className: 'text-xs font-bold text-slate-700 mb-1' }, fl.label),
+                  textArea(f[fl.key], function(v) { const pp = {}; pp[fl.key] = v; updateForm(pp); }, fl.ph, 3)
+                );
+              })).concat([
+                e('p', { key: 'len', className: 'text-2xs text-right font-bold ' + (pl >= PERF_MIN_LEN ? 'text-emerald-600' : 'text-amber-600') },
+                  '2번 전체 ' + pl + '자' + (pl < PERF_MIN_LEN ? ' (' + PERF_MIN_LEN + '자 이상 써 주세요)' : ' ✓'))
+              ]),
+              { badge: '필수', badgeClass: 'bg-violet-100 text-violet-800' }
+            );
+          })(),
+
+          (function() {
+            const mates = groupMateNames(myClass, myGroup);
+            const checks = f.peerChecks || {};
+            return sectionCard('3', '모둠원 평가', '공연 준비에 참여하지 않았거나 성실하지 않았던 모둠원이 있다면 이름을 체크하고 이유를 적어 주세요. 없으면 넘어가도 됩니다.',
+              !myClass || !myGroup
+                ? e('p', { className: 'text-xs text-slate-500 p-3 rounded-xl bg-slate-50' }, '맨 위에서 내 반과 조를 고르면 우리 조 친구 이름이 나타납니다.')
+                : [
+                    mates.length
+                      ? e('div', { key: 'm', className: 'flex flex-wrap gap-2' }, mates.map(function(n) {
+                          const on = Object.prototype.hasOwnProperty.call(checks, n);
+                          return chip('m-' + n, (on ? '☑ ' : '☐ ') + n, on, function() { togglePeer(n); });
+                        }))
+                      : e('p', { key: 'm', className: 'text-2xs text-slate-500' }, '선생님이 아직 우리 조 조원 이름을 입력하지 않았어요. 해당 친구가 있다면 아래 칸에 이름과 이유를 적어 주세요.')
+                  ].concat(Object.keys(checks).map(function(n) {
+                    return e('div', { key: 'r-' + n },
+                      e('p', { className: 'text-xs font-bold text-slate-700 mb-1' }, n + ' — 이유'),
+                      textArea(checks[n], function(v) { updatePeerReason(n, v); }, '예) 연습에 세 번 연속 오지 않았고 맡은 파트를 준비하지 않았다.', 2)
+                    );
+                  })).concat([
+                    e('div', { key: 'etc' },
+                      e('p', { className: 'text-xs font-bold text-slate-700 mb-1' }, mates.length ? '목록에 없는 친구가 있다면 (이름과 이유)' : '이름과 이유'),
+                      textArea(f.peerIssue, function(v) { updateForm({ peerIssue: v }); }, '예) 홍길동 — 연습에 세 번 연속 오지 않음', 2)
+                    )
+                  ]),
+              { badge: '선생님만 봐요', badgeClass: 'bg-rose-100 text-rose-700', border: 'border-rose-200' }
+            );
+          })(),
+
+          sectionCard('4', '다른 모둠 공연 평가', '같은 반 다른 모둠의 공연을 보고 별점(1~5)을 매긴 뒤 예술성·독창성·개선점·기타 의견을 적어 주세요. 한 모둠당 4칸을 모두 더해 ' + EVAL_MIN_LEN + '자 이상 써야 합니다.',
+            !myClass || !myGroup
+              ? e('p', { className: 'text-xs text-slate-500 p-3 rounded-xl bg-slate-50' }, '맨 위에서 내 반과 조를 고르면 평가할 모둠 4개가 나타납니다.')
+              : otherGroups(myGroup).map(function(g) {
+                  const gi = groupInfo[groupKey(myClass, g)] || {};
+                  const ev = (f.evals || {})[String(g)] || {};
+                  const len = evalTextLength(ev);
+                  return e('div', { key: g, className: 'p-3 sm:p-4 rounded-xl border border-slate-200 bg-slate-50 space-y-2.5' },
+                    e('div', { className: 'flex items-center justify-between gap-2 flex-wrap' },
+                      e('p', { className: 'text-sm font-black text-slate-900' }, myClass + '반 ' + g + '조', gi.title && e('span', { className: 'font-bold text-violet-700 ml-1.5' }, '· ' + gi.title)),
+                      ev.stars && len >= EVAL_MIN_LEN ? e('span', { className: 'text-2xs font-bold text-emerald-700' }, e('i', { className: 'fa-solid fa-check mr-0.5' }), '작성 완료') : null
+                    ),
+                    canSeeVideo
+                      ? e(VideoBox, { url: gi.video_url })
+                      : e('p', { className: 'text-2xs font-bold text-slate-500 p-2.5 rounded-lg bg-white border border-dashed border-slate-300' }, e('i', { className: 'fa-solid fa-lock mr-1' }), '반·조를 저장해 확정하면 우리 반 공연 영상이 여기에 나타나요.'),
+                    e('div', null, e(Stars, { value: ev.stars || 0, onChange: function(v) { updateEval(g, { stars: v }); } })),
+                    e('div', { className: 'grid grid-cols-1 sm:grid-cols-2 gap-2' },
+                      EVAL_FIELDS.map(function(fl) {
+                        return e('div', { key: fl.key },
+                          e('p', { className: 'text-xs font-bold text-slate-700 mb-1' }, fl.label),
+                          textArea(ev[fl.key], function(v) { const pp = {}; pp[fl.key] = v; updateEval(g, pp); }, fl.ph, 3)
+                        );
+                      })
+                    ),
+                    e('p', { className: 'text-2xs text-right font-bold ' + (len >= EVAL_MIN_LEN ? 'text-emerald-600' : 'text-amber-600') }, '4칸 합계 ' + len + '자' + (len < EVAL_MIN_LEN ? ' (' + EVAL_MIN_LEN + '자 이상)' : ' ✓'))
+                  );
+                }),
+            { badge: '선생님만 봐요', badgeClass: 'bg-rose-100 text-rose-700', border: 'border-rose-200' }
+          ),
+
+          // 저장 버튼
+          e('div', { className: 'sticky bottom-0 z-20 -mx-4 px-4 py-3 bg-white/95 backdrop-blur border-t border-slate-200' },
+            e('div', { className: 'max-w-5xl mx-auto flex flex-col sm:flex-row items-stretch sm:items-center gap-2' },
+              e('p', { className: 'text-2xs text-slate-500 flex-1' },
+                isPreview ? '교사 미리보기: 학생 화면과 똑같이 보이지만 저장되지 않습니다.'
+                  : alreadySubmitted ? '이미 최종 제출했어요. 고친 뒤에는 [수정 내용 다시 제출]을 눌러야 선생님께 반영됩니다.'
+                  : '[임시 저장]은 나중에 이어서 쓸 수 있고, [최종 제출]을 눌러야 선생님께 제출됩니다.'),
+              alreadySubmitted
+                ? e('button', { type: 'button', onClick: function() { saveAct(true); }, disabled: saveBusy, className: 'px-5 py-2.5 rounded-xl bg-violet-600 hover:bg-violet-700 text-white font-bold text-sm shadow ' + (saveBusy ? 'opacity-60 cursor-wait' : '') }, saveBusy ? '저장 중…' : '수정 내용 다시 제출')
+                : [
+                    e('button', { key: 't', type: 'button', onClick: function() { saveAct(false); }, disabled: saveBusy, className: 'px-4 py-2.5 rounded-xl border border-slate-300 text-slate-700 hover:bg-slate-50 font-bold text-sm ' + (saveBusy ? 'opacity-60 cursor-wait' : '') }, '임시 저장'),
+                    e('button', { key: 's', type: 'button', onClick: function() { saveAct(true); }, disabled: saveBusy, className: 'px-5 py-2.5 rounded-xl bg-violet-600 hover:bg-violet-700 text-white font-bold text-sm shadow ' + (saveBusy ? 'opacity-60 cursor-wait' : '') }, saveBusy ? '저장 중…' : '최종 제출')
+                  ]
+            )
+          )
+        );
+      };
+
+      // 학생: 마감·확정 뒤 읽기 전용 화면
+      const renderStudentLocked = function() {
+        const st = getActStatus(mySub);
+        return e('div', { className: 'space-y-4' },
+          e('div', { className: 'p-4 rounded-2xl bg-white border border-slate-200 flex items-center gap-3 flex-wrap' },
+            e('i', { className: 'fa-solid fa-lock text-rose-500' }),
+            e('p', { className: 'text-xs font-bold text-slate-700' }, myConfirmed ? '점수가 확정되어 더 이상 고칠 수 없어요. 제출한 내용과 점수만 볼 수 있습니다.' : '제출이 마감되었어요. 제출한 내용과 점수만 볼 수 있습니다.'),
+            e(StatusBadge, { status: st }),
+            mySub && mySub.classNo && e('span', { className: 'text-2xs font-bold px-2 py-0.5 rounded-full bg-violet-100 text-violet-800' }, mySub.classNo + '반 ' + (mySub.groupNo || '?') + '조')
+          ),
+          myAct && !myAct.isSubmitted && e('p', { className: 'text-xs text-amber-800 bg-amber-50 border border-amber-200 rounded-xl p-3' }, '최종 제출하지 않은 작성 중 기록입니다.'),
+          e(ActView, { act: myAct, groupInfo: groupInfo, classNo: mySub && mySub.classNo, groupNo: mySub && mySub.groupNo })
+        );
+      };
+
+      const renderActivityTab = function() {
+        const intro = e('div', { className: 'rounded-3xl bg-gradient-to-br from-violet-700 via-fuchsia-700 to-rose-600 text-white p-5 sm:p-6 shadow-lg' },
+          e('p', { className: 'text-xs font-bold text-violet-100' }, '2학년 5~8반 · 음악 연주와 창작'),
+          e('h2', { className: 'text-xl sm:text-2xl font-black mt-1' }, '공연 활동 및 모둠 상호평가'),
+          e('p', { className: 'text-xs sm:text-sm text-violet-50 mt-2 leading-relaxed' }, '내 반·조를 고른 뒤 ① 모둠 내 특별 활동(해당자만) ② 개인 활동 내용 ③ 모둠원 평가 ④ 다른 모둠 공연 평가(4개 모둠)를 작성하고 [최종 제출]을 누르세요.'),
+          e('div', { className: 'mt-3 flex flex-wrap gap-1.5 text-2xs font-bold' },
+            SCORE_ITEMS.map(function(it) { return e('span', { key: it.key, className: 'px-2 py-1 rounded-full bg-white/15' }, it.area + ' · ' + it.label + ' ' + it.max + '점'); }),
+            e('span', { className: 'px-2 py-1 rounded-full bg-white text-violet-800' }, '총 ' + TOTAL_MAX + '점')
+          ),
+          e('p', { className: 'text-2xs text-violet-100 mt-2' }, '※ 모둠 평가(공연 기획하기·공연하기)는 선생님이 채점하며, 같은 조 친구들은 같은 점수를 받습니다. ③·④에 쓴 내용은 선생님만 볼 수 있어요.')
+        );
+        if (!currentUser) {
+          return e('div', { className: 'space-y-4 max-w-5xl mx-auto' }, intro,
+            e('div', { className: 'p-5 rounded-2xl bg-white border border-slate-200 text-sm text-slate-600 flex items-center gap-2' },
+              e('i', { className: 'fa-solid fa-arrow-up text-violet-500' }),
+              e('span', null, '위쪽에서 학번과 비밀번호로 로그인하면 작성할 수 있어요. 처음이면 [최초 등록하기]를 눌러 주세요.')
+            )
+          );
+        }
+        if (currentUser.role === 'teacher') {
+          return e('div', { className: 'space-y-4 max-w-5xl mx-auto' }, intro,
+            e('div', { className: 'p-3 rounded-xl bg-amber-50 border border-amber-200 text-xs font-bold text-amber-900' }, '교사 미리보기: 학생에게 보이는 작성 화면입니다. 여기서 입력한 내용은 저장되지 않습니다.'),
+            renderStudentForm(true)
+          );
+        }
+        return e('div', { className: 'space-y-4 max-w-5xl mx-auto' }, intro,
+          renderStudentScore(),
+          studentLocked ? renderStudentLocked() : e('div', { className: 'space-y-2' },
+            e('div', { className: 'flex items-center gap-2 flex-wrap text-xs' },
+              e(StatusBadge, { status: getActStatus(mySub) }),
+              myAct && e('span', { className: 'text-2xs text-slate-500' }, '마지막 저장: ' + myAct.updatedAt)
+            ),
+            renderStudentForm(false)
+          )
+        );
+      };
+
+      // ---------------------------------------------------------
+      // 교사 대시보드
+      // ---------------------------------------------------------
+      const studentList = sortById(Object.keys(allSubmissions).filter(function(id) { return allSubmissions[id]; }).map(function(id) { return Object.assign({ studentId: id }, allSubmissions[id]); }));
+      const scoreCell = function(v) {
+        return v === null || v === undefined ? e('span', { className: 'text-slate-300' }, '–') : e('span', { className: 'font-bold' }, v);
+      };
+
+      const renderSubmissionsTab = function() {
+        const filtered = studentList.filter(function(s) {
+          if (classFilter === 'all') return true;
+          if (classFilter === 'none') return !s.classNo || !s.groupNo;
+          return Number(s.classNo) === Number(classFilter);
+        });
+        const count = function(kind) { return filtered.filter(function(s) { return getActStatus(s).kind === kind; }).length; };
+        const filters = [['all', '전체']].concat(CLASSES.map(function(c) { return [String(c), c + '반']; })).concat([['none', '반·조 미선택']]);
+        return e('div', { className: 'bg-white rounded-3xl border border-slate-200 p-4 sm:p-6 shadow-sm space-y-4' },
+          e('div', { className: 'flex flex-wrap items-center gap-2' },
+            filters.map(function(fl) {
+              return e('button', { key: fl[0], onClick: function() { setClassFilter(fl[0]); }, className: 'px-3 py-1.5 rounded-lg text-xs font-bold ' + (String(classFilter) === fl[0] ? 'bg-purple-900 text-white' : 'bg-slate-100 text-slate-600 hover:bg-slate-200') }, fl[1]);
+            }),
+            e('span', { className: 'ml-auto text-2xs text-slate-500' }, filtered.length + '명 · 제출 ' + (count('submitted') + count('resubmitted') + count('graded')) + ' · 작성 중 ' + count('draft') + ' · 채점 완료 ' + count('graded'))
+          ),
+          e('div', { className: 'overflow-x-auto' },
+            e('table', { className: 'w-full text-left text-xs' },
+              e('thead', null,
+                e('tr', { className: 'border-b border-slate-200 bg-slate-50 whitespace-nowrap' },
+                  e('th', { className: 'py-2 px-2' }, '학번'),
+                  e('th', { className: 'px-2' }, '이름'),
+                  e('th', { className: 'px-2' }, '반·조'),
+                  e('th', { className: 'px-2' }, '상태'),
+                  e('th', { className: 'px-2 text-center' }, '기획(20)'),
+                  e('th', { className: 'px-2 text-center' }, '공연(30)'),
+                  e('th', { className: 'px-2 text-center' }, '참여(10)'),
+                  e('th', { className: 'px-2 text-center' }, '감상평(40)'),
+                  e('th', { className: 'px-2 text-center' }, '총점(100)'),
+                  e('th', { className: 'px-2 text-center' }, '관리')
+                )
+              ),
+              e('tbody', { className: 'divide-y divide-slate-100' },
+                filtered.length === 0 ? e('tr', null,
+                  e('td', { colSpan: 10, className: 'py-8 text-center text-slate-400' }, '아직 학생 기록이 없습니다. 학생이 등록하고 작성하면 바로 표시됩니다.')
+                ) : filtered.map(function(s) {
+                  const sc = computeScores(s, groupInfo);
+                  const conf = getConfirmed(s);
+                  return e('tr', { key: s.studentId, className: 'whitespace-nowrap' },
+                    e('td', { className: 'py-2.5 px-2 font-mono font-bold' }, s.studentId),
+                    e('td', { className: 'px-2' }, s.studentName),
+                    e('td', { className: 'px-2' }, s.classNo && s.groupNo ? s.classNo + '반 ' + s.groupNo + '조' : e('span', { className: 'text-rose-500 font-bold' }, '미선택')),
+                    e('td', { className: 'px-2' }, e(StatusBadge, { status: getActStatus(s) })),
+                    e('td', { className: 'px-2 text-center' }, scoreCell(sc.plan)),
+                    e('td', { className: 'px-2 text-center' }, scoreCell(sc.perform)),
+                    e('td', { className: 'px-2 text-center' }, scoreCell(sc.participation)),
+                    e('td', { className: 'px-2 text-center' }, scoreCell(sc.review)),
+                    e('td', { className: 'px-2 text-center font-black text-indigo-700' }, sc.any ? sc.total : '–', conf && e('i', { className: 'fa-solid fa-circle-check text-emerald-500 ml-1', title: '확정됨' })),
+                    e('td', { className: 'px-2' },
+                      e('div', { className: 'flex items-center justify-center gap-1.5' },
+                        e('button', { onClick: function() { openGrading(s); }, className: 'px-2.5 py-1 rounded bg-slate-900 text-white font-bold text-2xs hover:bg-slate-800' }, '채점하기'),
+                        conf
+                          ? e('button', { onClick: function() { setStudentConfirmed(s.studentId, false); }, title: '확정 시각: ' + conf.at + ' · 누르면 확정 취소', className: 'px-2.5 py-1 rounded bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-2xs flex items-center gap-1' },
+                              e('i', { className: 'fa-solid fa-circle-check' }), e('span', null, '확정됨 · 취소'))
+                          : e('button', { onClick: function() { setStudentConfirmed(s.studentId, true); }, className: 'px-2.5 py-1 rounded border border-emerald-500 text-emerald-700 hover:bg-emerald-50 font-bold text-2xs flex items-center gap-1' },
+                              e('i', { className: 'fa-solid fa-stamp' }), e('span', null, '확정하기')),
+                        e('button', { onClick: function() {
+                          setEditingStudentTargetId(s.studentId);
+                          setEditingStudentForm({ id: s.studentId, name: s.studentName || '', classNo: s.classNo ? String(s.classNo) : '', groupNo: s.groupNo ? String(s.groupNo) : '' });
+                          setEditingStudentModal(true);
+                        }, className: 'px-2.5 py-1 rounded bg-rose-600 hover:bg-rose-700 text-white font-bold text-2xs flex items-center gap-1' },
+                          e('i', { className: 'fa-solid fa-user-pen' }), e('span', null, '편집 및 삭제'))
+                      )
+                    )
+                  );
+                })
+              )
+            )
+          )
+        );
+      };
+
+      const scoreSelect = function(value, onChange, item, disabled) {
+        return e('select', {
+          value: value, disabled: !!disabled,
+          onChange: function(ev) { onChange(ev.target.value); },
+          className: 'w-full p-2 border rounded-lg bg-white text-sm font-bold disabled:bg-slate-100'
+        },
+          e('option', { value: '' }, '채점 전'),
+          item.options.map(function(o) { return e('option', { key: o, value: String(o) }, o + '점'); })
+        );
+      };
+
+      const renderGroupsTab = function() {
+        const c = groupClass;
+        return e('div', { className: 'space-y-4' },
+          e('div', { className: 'flex flex-wrap items-center gap-2' },
+            CLASSES.map(function(cc) {
+              return e('button', { key: cc, onClick: function() { setGroupClass(cc); }, className: 'px-4 py-2 rounded-xl text-sm font-bold ' + (c === cc ? 'bg-purple-900 text-white shadow' : 'bg-white border border-slate-200 text-slate-600 hover:bg-slate-50') }, cc + '반');
+            }),
+            e('p', { className: 'text-2xs text-slate-500 ml-auto' }, '평균 별점은 학생이 [최종 제출]한 평가만 계산합니다.')
+          ),
+          // 반 전체 한눈에 보기
+          e('div', { className: 'bg-white rounded-2xl border border-slate-200 shadow-sm overflow-x-auto' },
+            e('table', { className: 'w-full text-xs' },
+              e('thead', null, e('tr', { className: 'bg-slate-50 border-b border-slate-200 whitespace-nowrap text-left' },
+                e('th', { className: 'py-2 px-3' }, '조'), e('th', { className: 'px-3' }, '공연 제목'), e('th', { className: 'px-3 text-center' }, '등록 조원'),
+                e('th', { className: 'px-3 text-center' }, '받은 평가'), e('th', { className: 'px-3' }, '평균 별점'),
+                e('th', { className: 'px-3 text-center' }, '기획(20)'), e('th', { className: 'px-3 text-center' }, '공연(30)'), e('th', { className: 'px-3' }, '')
+              )),
+              e('tbody', { className: 'divide-y divide-slate-100' },
+                GROUPS.map(function(g) {
+                  const gi = groupInfo[groupKey(c, g)] || {};
+                  const members = studentList.filter(function(s) { return Number(s.classNo) === c && Number(s.groupNo) === g; });
+                  const stats = evalStats(collectGroupEvals(allSubmissions, c, g));
+                  return e('tr', { key: g, className: 'whitespace-nowrap' },
+                    e('td', { className: 'py-2.5 px-3 font-black' }, g + '조'),
+                    e('td', { className: 'px-3 max-w-[220px] truncate' }, gi.title || e('span', { className: 'text-slate-300' }, '미등록')),
+                    e('td', { className: 'px-3 text-center' }, members.length + '명'),
+                    e('td', { className: 'px-3 text-center' }, stats.count + '건', stats.draftCount ? e('span', { className: 'text-slate-400' }, ' (+작성 중 ' + stats.draftCount + ')') : null),
+                    e('td', { className: 'px-3' }, stats.avg === null ? e('span', { className: 'text-slate-300' }, '–') : e('span', { className: 'inline-flex items-center gap-1.5' }, e(Stars, { value: Math.round(stats.avg), readOnly: true, size: 'text-xs' }), e('b', null, stats.avg.toFixed(2)))),
+                    e('td', { className: 'px-3 text-center' }, scoreCell(isNum(gi.plan_score) ? gi.plan_score : null)),
+                    e('td', { className: 'px-3 text-center' }, scoreCell(isNum(gi.perform_score) ? gi.perform_score : null)),
+                    e('td', { className: 'px-3' }, e('button', { onClick: function() { setGroupEvalViewer({ c: c, g: g }); }, className: 'px-2.5 py-1 rounded bg-violet-600 hover:bg-violet-700 text-white font-bold text-2xs' }, '받은 평가 보기'))
+                  );
+                })
+              )
+            )
+          ),
+          // 모둠별 입력 카드
+          e('div', { className: 'grid grid-cols-1 lg:grid-cols-2 gap-3' },
+            GROUPS.map(function(g) {
+              const k = groupKey(c, g);
+              const d = getGroupDraft(c, g);
+              const members = studentList.filter(function(s) { return Number(s.classNo) === c && Number(s.groupNo) === g; });
+              const input = function(field, ph) {
+                return e('input', {
+                  type: 'text', value: d[field] || '', placeholder: ph,
+                  onChange: function(ev) { const p = {}; p[field] = ev.target.value; setGroupDraft(c, g, p); },
+                  className: 'w-full p-2 border border-slate-300 rounded-lg text-xs'
+                });
+              };
+              return e('div', { key: k, className: 'bg-white rounded-2xl border border-slate-200 p-4 shadow-sm space-y-2.5 text-xs' },
+                e('div', { className: 'flex items-center justify-between' },
+                  e('p', { className: 'text-sm font-black text-slate-900' }, c + '반 ' + g + '조'),
+                  groupDrafts[k] && e('span', { className: 'text-2xs font-bold text-amber-600' }, '저장 안 된 변경 있음')
+                ),
+                e('div', null, e('label', { className: 'block font-bold text-slate-600 mb-0.5' }, '공연 제목'), input('title', '예) 우리들의 여름 콘서트')),
+                e('div', null, e('label', { className: 'block font-bold text-slate-600 mb-0.5' }, '영상 링크 (유튜브 일부 공개 링크)'), input('video_url', 'https://youtu.be/...')),
+                e('div', null, e('label', { className: 'block font-bold text-slate-600 mb-0.5' }, '조원 이름 (학생이 자기 조를 찾을 때 보여요)'), input('members', '예) 김OO, 이OO, 박OO')),
+                e('div', { className: 'grid grid-cols-2 gap-2' },
+                  e('div', null, e('label', { className: 'block font-bold text-violet-700 mb-0.5' }, '공연 기획하기 (20)'), scoreSelect(d.plan, function(v) { setGroupDraft(c, g, { plan: v }); }, SCORE_ITEMS[0])),
+                  e('div', null, e('label', { className: 'block font-bold text-violet-700 mb-0.5' }, '공연하기 (30)'), scoreSelect(d.perform, function(v) { setGroupDraft(c, g, { perform: v }); }, SCORE_ITEMS[1]))
+                ),
+                e('p', { className: 'text-2xs text-slate-500' }, '사이트에 등록한 조원: ' + (members.length ? members.map(function(s) { return s.studentName; }).join(', ') : '없음')),
+                e('div', { className: 'flex gap-2' },
+                  e('button', { onClick: function() { saveGroupCard(c, g); }, disabled: groupBusy === k, className: 'flex-1 py-2 rounded-lg bg-purple-700 hover:bg-purple-800 text-white font-bold ' + (groupBusy === k ? 'opacity-60 cursor-wait' : '') }, groupBusy === k ? '저장 중…' : '저장'),
+                  groupDrafts[k] && e('button', { onClick: function() { setGroupDrafts(function(prev) { const up = Object.assign({}, prev); delete up[k]; return up; }); }, className: 'px-3 py-2 rounded-lg border border-slate-300 text-slate-600 font-bold' }, '되돌리기')
+                )
+              );
+            })
+          )
+        );
+      };
+
+      const renderAuthTab = function() {
+        return e('div', { className: 'bg-white rounded-3xl border border-slate-200 p-6 shadow-sm max-w-md space-y-4 text-xs' },
+          e('div', { className: 'border-b pb-2' },
+            e('h3', { className: 'text-sm font-bold text-slate-900' }, '교사 관리자 계정 설정'),
+            e('p', { className: 'text-2xs text-slate-500' }, '로그인 시 사용할 아이디와 6자리 숫자 비밀번호를 설정하세요. 서버에 저장되어 어느 컴퓨터에서든 같은 정보로 로그인합니다.')
+          ),
+          e('form', { onSubmit: handleSaveTeacherAuth, className: 'space-y-3' },
+            e('div', null,
+              e('label', { className: 'block font-bold text-slate-700 mb-1' }, '교사 아이디'),
+              e('input', { type: 'text', value: newTeacherId, onChange: function(ev) { setNewTeacherId(ev.target.value); }, placeholder: '새 교사 아이디', className: 'w-full p-2.5 border rounded-xl text-xs font-mono', required: true })
+            ),
+            e('div', null,
+              e('label', { className: 'block font-bold text-slate-700 mb-1' }, '지금 쓰고 있는 비밀번호'),
+              e('input', { type: 'password', maxLength: 6, value: currentTeacherPw, onChange: function(ev) { setCurrentTeacherPw(ev.target.value); }, placeholder: '현재 6자리 비밀번호', className: 'w-full p-2.5 border rounded-xl text-xs font-mono tracking-widest', required: true })
+            ),
+            e('div', null,
+              e('label', { className: 'block font-bold text-slate-700 mb-1' }, '새로운 비밀번호 (6자리 숫자)'),
+              e('input', { type: 'password', maxLength: 6, value: newTeacherPw, onChange: function(ev) { setNewTeacherPw(ev.target.value); }, placeholder: '6자리 숫자', className: 'w-full p-2.5 border rounded-xl text-xs font-mono tracking-widest', required: true })
+            ),
+            e('button', { type: 'submit', className: 'w-full py-2.5 rounded-xl bg-purple-600 hover:bg-purple-700 text-white font-bold transition shadow' }, '계정 정보 저장하기')
+          )
+        );
+      };
+
+      const renderTeacherDash = function() {
+        const subTabBtn = function(key, icon, label) {
+          return e('button', {
+            key: key,
+            onClick: function() { setTeacherSubTab(key); if (key !== 'auth_edit') fetchSubmissionsFromCloud(); },
+            className: 'px-3.5 py-2 rounded-xl text-xs font-bold transition flex items-center gap-1.5 ' + (teacherSubTab === key ? 'bg-purple-900 text-white shadow' : 'bg-white text-slate-600 hover:bg-slate-100')
+          }, e('i', { className: 'fa-solid ' + icon }), e('span', null, label));
+        };
+        return e('div', { className: 'space-y-5' },
+          e('div', { className: 'bg-gradient-to-r from-purple-900 to-indigo-950 rounded-3xl p-6 text-white flex flex-col md:flex-row items-start md:items-center justify-between gap-4 shadow-lg' },
+            e('div', null,
+              e('div', { className: 'flex items-center gap-2 mb-1 flex-wrap' },
+                e('i', { className: 'fa-solid fa-shield-halved text-purple-400' }),
+                e('span', { className: 'text-xs font-bold text-purple-300' }, 'TEACHER MANAGEMENT PORTAL'),
+                e('span', { className: 'text-2xs font-bold px-2 py-0.5 rounded-full flex items-center gap-1 ' + (serverStatus === 'online' ? 'bg-emerald-500/20 text-emerald-200' : serverStatus === 'checking' ? 'bg-slate-500/30 text-slate-200' : 'bg-amber-400/25 text-amber-200') },
+                  e('i', { className: 'fa-solid ' + (serverStatus === 'online' ? 'fa-circle-check' : serverStatus === 'checking' ? 'fa-spinner fa-spin' : 'fa-plug-circle-xmark') }),
+                  e('span', null, serverStatus === 'online' ? '서버 정상' : serverStatus === 'checking' ? '서버 확인 중' : (OFFLINE_MODE ? '오프라인 모드' : '서버 응답 없음 · 1분마다 재확인'))
+                ),
+                isCloudSyncing && e('span', { className: 'text-2xs bg-purple-800 text-purple-200 px-2 py-0.5 rounded-full flex items-center gap-1' },
+                  e('i', { className: 'fa-solid fa-spinner fa-spin' }), e('span', null, '불러오는 중...'))
+              ),
+              e('h2', { className: 'text-xl font-black' }, '공연 활동 및 모둠 상호평가 관리'),
+              e('p', { className: 'text-xs text-slate-300 mt-1' }, '모둠 평가(기획 20 · 공연 30)는 조별로 한 번 입력하면 조원 모두에게 적용 · 개인 평가(참여 10 · 감상평 40) · 총 100점')
+            ),
+            e('div', { className: 'flex flex-wrap gap-2' },
+              e('button', { onClick: function() {
+                checkServer().then(function(ok) {
+                  if (ok) fetchSubmissionsFromCloud();
+                  else showToast('서버가 아직 응답하지 않습니다. 잠시 후 다시 눌러 주세요.', 4000);
+                });
+              }, className: 'px-3.5 py-2 rounded-xl bg-indigo-600 hover:bg-indigo-700 text-white font-bold text-xs shadow transition flex items-center gap-1.5' },
+                e('i', { className: 'fa-solid fa-arrows-rotate' }), e('span', null, '새로고침')),
+              e('button', { onClick: downloadExcel, disabled: excelBusy, className: 'px-3.5 py-2 rounded-xl bg-emerald-600 hover:bg-emerald-700 text-white font-bold text-xs shadow transition flex items-center gap-1.5 ' + (excelBusy ? 'opacity-60 cursor-wait' : '') },
+                e('i', { className: 'fa-solid fa-file-excel' }), e('span', null, excelBusy ? '엑셀 만드는 중…' : '엑셀 다운로드')),
+              e('button', { onClick: function() {
+                setDeadlineInput(toLocalInputValue(portal.deadline));
+                setDeadlinePw('');
+                setShowDeadlineModal(true);
+                refreshPortalStatus();
+              }, className: 'px-3.5 py-2 rounded-xl text-white font-bold text-xs shadow transition flex items-center gap-1.5 ' + (closedNow ? 'bg-slate-700 hover:bg-slate-800' : 'bg-amber-600 hover:bg-amber-700') },
+                e('i', { className: 'fa-solid ' + (closedNow ? 'fa-lock' : 'fa-clock') }),
+                e('span', null, closedNow ? '제출 마감됨 · 설정' : (portal.deadline ? '마감 ' + formatDeadline(portal.deadline) : '제출 마감 설정'))),
+              e('button', { onClick: resetAllData, className: 'px-3.5 py-2 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold text-xs shadow transition' }, '학기 데이터 리셋')
+            )
+          ),
+          e('div', { className: 'flex flex-wrap items-center gap-2 border-b border-slate-200 pb-2' },
+            subTabBtn('submissions', 'fa-clipboard-list', '학생 제출 및 채점 (' + studentList.length + '명)'),
+            subTabBtn('groups', 'fa-people-group', '모둠 관리 · 받은 평가 모아보기'),
+            subTabBtn('auth_edit', 'fa-key', '교사 계정 설정')
+          ),
+          teacherSubTab === 'submissions' && renderSubmissionsTab(),
+          teacherSubTab === 'groups' && renderGroupsTab(),
+          teacherSubTab === 'auth_edit' && renderAuthTab()
+        );
+      };
+
+      // 교사 채점 창
+      const renderGradingModal = function() {
+        const s = allSubmissions[gradingStudentId];
+        if (!s) return null;
+        const c = s.classNo, g = s.groupNo;
+        const hasGroup = !!(c && g);
+        const gi = hasGroup ? (groupInfo[groupKey(c, g)] || {}) : {};
+        const members = hasGroup ? studentList.filter(function(x) { return Number(x.classNo) === Number(c) && Number(x.groupNo) === Number(g); }) : [];
+        const stats = hasGroup ? evalStats(collectGroupEvals(allSubmissions, c, g)) : null;
+        const act = s.reports && s.reports.act;
+        const st = getActStatus(s);
+        const set = function(k, v) { const p = {}; p[k] = v; setGradingForm(Object.assign({}, gradingForm, p)); };
+        const preview = {
+          plan: scoreVal(gradingForm.plan), perform: scoreVal(gradingForm.perform),
+          participation: scoreVal(gradingForm.participation), review: scoreVal(gradingForm.review)
+        };
+        preview.total = (preview.plan || 0) + (preview.perform || 0) + (preview.participation || 0) + (preview.review || 0);
+        const close = function() { if (!gradingBusy) setGradingStudentId(null); };
+        return e('div', { className: 'fixed inset-0 z-50 flex items-center justify-center p-2 sm:p-6 bg-slate-900/60 backdrop-blur-sm' },
+          e('div', { className: 'bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-4xl max-h-[94vh] flex flex-col overflow-hidden' },
+            e('div', { className: 'p-4 sm:p-5 border-b border-slate-200 flex items-start justify-between bg-slate-50' },
+              e('div', null,
+                e('div', { className: 'flex items-center gap-2 flex-wrap' },
+                  e(StatusBadge, { status: st }),
+                  hasGroup ? e('span', { className: 'text-2xs font-bold px-2 py-0.5 rounded-full bg-violet-100 text-violet-800' }, c + '반 ' + g + '조') : e('span', { className: 'text-2xs font-bold px-2 py-0.5 rounded-full bg-rose-100 text-rose-700' }, '반·조 미선택'),
+                  getConfirmed(s) && e('span', { className: 'text-2xs font-bold px-2 py-0.5 rounded-full bg-emerald-100 text-emerald-800' }, '확정됨 (' + getConfirmed(s).at + ')')
+                ),
+                e('h3', { className: 'text-base font-black text-slate-900 mt-1' }, s.studentName + ' (' + s.studentId + ') 채점하기'),
+                act && e('p', { className: 'text-2xs text-slate-500' }, (act.isSubmitted ? '최종 제출: ' : '작성 중 · 마지막 저장: ') + act.updatedAt)
+              ),
+              e('button', { onClick: close, className: 'text-slate-400 hover:text-slate-600' }, e('i', { className: 'fa-solid fa-xmark text-lg' }))
+            ),
+            e('div', { className: 'p-4 sm:p-5 overflow-y-auto space-y-4 flex-1 text-xs' },
+              // ① 모둠 평가 (맨 위)
+              e('div', { className: 'p-4 rounded-2xl border-2 border-violet-300 bg-violet-50 space-y-3' },
+                e('div', { className: 'flex items-center justify-between gap-2 flex-wrap' },
+                  e('p', { className: 'text-sm font-black text-violet-900' }, e('i', { className: 'fa-solid fa-people-group mr-1.5' }), '모둠 평가' + (hasGroup ? ' — ' + c + '반 ' + g + '조' : '')),
+                  hasGroup && e('span', { className: 'text-2xs font-bold text-violet-700' }, '저장하면 이 조 학생 ' + Math.max(members.length, 1) + '명 모두에게 적용됩니다')
+                ),
+                !hasGroup
+                  ? e('p', { className: 'text-xs text-rose-700 font-bold' }, '이 학생이 아직 반·조를 고르지 않았습니다. [편집 및 삭제]에서 반·조를 정해 주면 모둠 점수를 줄 수 있어요.')
+                  : [
+                      e('div', { key: 'info', className: 'text-2xs text-violet-900 space-y-1' },
+                        e('p', null, e('b', null, '공연 제목: '), gi.title || '미등록'),
+                        e('p', null, e('b', null, '사이트에 등록한 조원: '), members.map(function(x) { return x.studentName; }).join(', ') || '없음'),
+                        stats && e('p', { className: 'flex items-center gap-1.5' }, e('b', null, '다른 모둠 학생들의 평균 별점: '),
+                          stats.avg === null ? '아직 없음' : [e(Stars, { key: 's', value: Math.round(stats.avg), readOnly: true, size: 'text-xs' }), e('span', { key: 't' }, stats.avg.toFixed(2) + ' (' + stats.count + '건)')],
+                          e('button', { type: 'button', onClick: function() { setGroupEvalViewer({ c: c, g: g }); }, className: 'ml-1 underline font-bold' }, '받은 평가 보기')
+                        )
+                      ),
+                      gi.video_url && e('div', { key: 'v' }, e(VideoBox, { url: gi.video_url })),
+                      e('div', { key: 'sel', className: 'grid grid-cols-2 gap-3' },
+                        e('div', null, e('label', { className: 'block font-bold text-slate-700 mb-1' }, '공연 기획하기 (20 / 10)'), scoreSelect(gradingForm.plan, function(v) { set('plan', v); }, SCORE_ITEMS[0])),
+                        e('div', null, e('label', { className: 'block font-bold text-slate-700 mb-1' }, '공연하기 (30 / 20 / 10)'), scoreSelect(gradingForm.perform, function(v) { set('perform', v); }, SCORE_ITEMS[1]))
+                      )
+                    ]
+              ),
+              // ② 학생이 쓴 내용
+              e('div', { className: 'space-y-2' },
+                e('p', { className: 'text-sm font-black text-slate-800' }, '학생이 작성한 개인 평가 내용'),
+                e(ActView, { act: act, groupInfo: groupInfo, classNo: c, groupNo: g, forTeacher: true })
+              ),
+              // ③ 개인 평가
+              e('div', { className: 'p-4 rounded-2xl border-2 border-sky-300 bg-sky-50 space-y-3' },
+                e('p', { className: 'text-sm font-black text-sky-900' }, e('i', { className: 'fa-solid fa-user-check mr-1.5' }), '개인 평가'),
+                !act || !act.isSubmitted ? e('p', { className: 'text-2xs text-amber-700 font-bold' }, '⚠ 학생이 아직 최종 제출하지 않았어요. 그래도 채점할 수 있습니다.') : null,
+                e('div', { className: 'grid grid-cols-2 gap-3' },
+                  e('div', null, e('label', { className: 'block font-bold text-slate-700 mb-1' }, '공연 참여 과정 (10 / 0)'), scoreSelect(gradingForm.participation, function(v) { set('participation', v); }, SCORE_ITEMS[2])),
+                  e('div', null, e('label', { className: 'block font-bold text-slate-700 mb-1' }, '감상평 작성하기 (40 / 30 / 20)'), scoreSelect(gradingForm.review, function(v) { set('review', v); }, SCORE_ITEMS[3]))
+                ),
+                e('div', null,
+                  e('label', { className: 'block font-bold text-slate-700 mb-1' }, e('i', { className: 'fa-solid fa-comment-dots text-indigo-500 mr-1' }), '학생에게 보여 줄 코멘트'),
+                  e('textarea', { rows: 2, value: gradingForm.comment, onChange: function(ev) { set('comment', ev.target.value); }, placeholder: '점수의 이유나 칭찬·보완할 점을 적어 주세요. 학생 화면에 그대로 보입니다.', className: 'w-full p-2 border rounded-lg bg-white text-xs leading-relaxed' })
+                ),
+                e('div', null,
+                  e('label', { className: 'block font-bold text-slate-700 mb-1' }, e('i', { className: 'fa-solid fa-lock text-slate-500 mr-1' }), '세특 메모 (선생님만)'),
+                  e('textarea', { rows: 2, value: gradingForm.teacherFeedback, onChange: function(ev) { set('teacherFeedback', ev.target.value); }, placeholder: '학교생활기록부 세부능력 특기사항용 메모. 학생에게 보이지 않습니다.', className: 'w-full p-2 border rounded-lg bg-white text-xs leading-relaxed' })
+                )
+              )
+            ),
+            e('div', { className: 'p-4 border-t border-slate-200 bg-slate-50 flex flex-col sm:flex-row items-stretch sm:items-center gap-2' },
+              e('p', { className: 'text-xs font-bold text-slate-700 flex-1' }, '저장할 총점: ', e('span', { className: 'text-lg font-black text-indigo-700' }, preview.total), ' / ' + TOTAL_MAX + '점',
+                e('span', { className: 'text-2xs font-medium text-slate-500 ml-2' }, '(기획 ' + (preview.plan === null ? '–' : preview.plan) + ' · 공연 ' + (preview.perform === null ? '–' : preview.perform) + ' · 참여 ' + (preview.participation === null ? '–' : preview.participation) + ' · 감상평 ' + (preview.review === null ? '–' : preview.review) + ')')),
+              e('button', { onClick: close, className: 'px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100' }, '닫기'),
+              e('button', { onClick: function() { saveGrading(s.studentId); }, disabled: gradingBusy, className: 'px-5 py-2 rounded-xl bg-purple-700 hover:bg-purple-800 text-white text-xs font-bold shadow ' + (gradingBusy ? 'opacity-60 cursor-wait' : '') }, gradingBusy ? '저장 중…' : '채점 저장')
+            )
+          )
+        );
+      };
+
+      // 모둠이 받은 평가 모아보기 창
+      const renderGroupEvalModal = function() {
+        const c = groupEvalViewer.c, g = groupEvalViewer.g;
+        const gi = groupInfo[groupKey(c, g)] || {};
+        const list = collectGroupEvals(allSubmissions, c, g);
+        const stats = evalStats(list);
+        return e('div', { className: 'fixed inset-0 z-[55] flex items-center justify-center p-2 sm:p-6 bg-slate-900/60 backdrop-blur-sm' },
+          e('div', { className: 'bg-white rounded-3xl shadow-2xl border border-slate-200 w-full max-w-3xl max-h-[92vh] flex flex-col overflow-hidden' },
+            e('div', { className: 'p-5 border-b border-slate-200 flex items-start justify-between bg-violet-50' },
+              e('div', null,
+                e('p', { className: 'text-2xs font-bold text-violet-700' }, '모둠별 받은 평가 모아보기 (선생님만)'),
+                e('h3', { className: 'text-base font-black text-slate-900' }, c + '반 ' + g + '조' + (gi.title ? ' · ' + gi.title : '')),
+                e('div', { className: 'flex items-center gap-2 mt-1 text-xs' },
+                  stats.avg === null ? e('span', { className: 'text-slate-500' }, '최종 제출된 평가가 아직 없어요.') : [
+                    e(Stars, { key: 's', value: Math.round(stats.avg), readOnly: true, size: 'text-sm' }),
+                    e('b', { key: 'a' }, '평균 ' + stats.avg.toFixed(2)),
+                    e('span', { key: 'n', className: 'text-slate-500' }, '(' + stats.count + '건' + (stats.draftCount ? ', 작성 중 ' + stats.draftCount + '건 제외' : '') + ')')
+                  ]
+                )
+              ),
+              e('button', { onClick: function() { setGroupEvalViewer(null); }, className: 'text-slate-400 hover:text-slate-600' }, e('i', { className: 'fa-solid fa-xmark text-lg' }))
+            ),
+            e('div', { className: 'p-5 overflow-y-auto space-y-2 flex-1 text-xs' },
+              list.length === 0 ? e('p', { className: 'text-slate-400 text-center py-8' }, '아직 받은 평가가 없습니다.') :
+              list.map(function(x) {
+                return e('div', { key: x.studentId, className: 'p-3 rounded-xl border ' + (x.submitted ? 'border-slate-200 bg-white' : 'border-amber-200 bg-amber-50') + ' space-y-1' },
+                  e('div', { className: 'flex items-center justify-between gap-2 flex-wrap' },
+                    e('p', { className: 'font-bold text-slate-700' }, x.studentName + ' (' + x.studentId + ') · ' + x.fromGroup + '조', !x.submitted && e('span', { className: 'ml-1.5 text-2xs text-amber-700' }, '작성 중')),
+                    e(Stars, { value: x.stars, readOnly: true, size: 'text-sm' })
+                  ),
+                  e('div', { className: 'grid grid-cols-1 sm:grid-cols-2 gap-2 mt-1' },
+                    EVAL_FIELDS.map(function(fl) {
+                      return e('div', { key: fl.key, className: 'p-2 rounded-lg bg-slate-50' },
+                        e('p', { className: 'text-2xs font-black text-violet-700 mb-0.5' }, fl.label),
+                        e('p', { className: 'whitespace-pre-wrap leading-relaxed text-slate-700' }, tlen(x.ev[fl.key]) ? x.ev[fl.key] : '(작성하지 않음)')
+                      );
+                    })
+                  )
+                );
+              })
+            ),
+            e('div', { className: 'p-4 border-t border-slate-200 bg-slate-50 flex justify-end' },
+              e('button', { onClick: function() { setGroupEvalViewer(null); }, className: 'px-4 py-2 rounded-xl text-xs font-bold text-slate-600 hover:bg-slate-100' }, '닫기')
+            )
+          )
+        );
+      };
+
+      // ---------------------------------------------------------
+      // 전체 화면
+      // ---------------------------------------------------------
+      return e('div', { className: 'min-h-screen flex flex-col' },
+        // [점수 확정] 학생 로그인 시 최종 점수 팝업
+        showFinalPopup && myConfirmed && e('div', { className: 'fixed inset-0 z-[60] flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm' },
+          e('div', { className: 'bg-white rounded-3xl shadow-2xl border border-violet-200 w-full max-w-sm overflow-hidden' },
+            e('div', { className: 'p-5 bg-violet-900 text-white text-center' },
+              e('p', { className: 'text-xs font-bold text-violet-200' }, currentUser.name + ' 님의 공연 활동 수행평가'),
+              e('p', { className: 'text-sm font-bold mt-1' }, '최종 점수'),
+              e('p', { className: 'text-4xl font-black mt-1' }, myConfirmed.total, e('span', { className: 'text-base font-bold text-violet-200 ml-1' }, '/ ' + TOTAL_MAX + '점')),
+              e('p', { className: 'text-2xs text-violet-200 mt-1' }, '확정: ' + myConfirmed.at)
+            ),
+            e('div', { className: 'p-4 space-y-1.5' },
+              SCORE_ITEMS.map(function(it) {
+                const v = myConfirmed[it.key];
+                return e('div', { key: it.key, className: 'flex items-center justify-between px-3 py-2 rounded-xl bg-slate-50 border border-slate-200 text-xs' },
+                  e('span', null, e('span', { className: 'text-2xs font-bold text-slate-400 mr-1.5' }, it.area), e('b', { className: 'text-slate-800' }, it.label)),
+                  e('span', { className: 'font-black text-violet-900' }, (isNum(v) ? v : 0) + '점', e('span', { className: 'text-2xs font-bold text-slate-400 ml-0.5' }, '/ ' + it.max))
+                );
+              })
+            ),
+            e('div', { className: 'p-4 pt-0' },
+              e('button', { onClick: function() { setShowFinalPopup(false); }, className: 'w-full py-2.5 rounded-xl bg-violet-600 hover:bg-violet-700 text-white font-bold text-xs' }, '확인')
+            )
+          )
+        ),
+        // 토스트 메시지
+        toastMessage && e('div', { className: 'fixed top-5 left-1/2 -translate-x-1/2 z-[70] max-w-[92vw] bg-slate-900 text-white px-5 py-2.5 rounded-2xl shadow-2xl text-xs font-bold border border-slate-700 flex items-center gap-2' },
+          e('i', { className: 'fa-solid fa-circle-check text-emerald-400' }),
+          e('span', null, toastMessage)
+        ),
+
+        // 메인 헤더
+        e('header', { className: 'bg-white border-b border-slate-200 sticky top-0 z-30 shadow-sm' },
+          e('div', { className: 'max-w-7xl mx-auto px-4 py-3 flex items-center justify-between gap-3' },
+            e('div', { className: 'flex items-center gap-3 min-w-0' },
+              e('div', { className: 'w-10 h-10 shrink-0 rounded-xl bg-gradient-to-tr from-violet-600 via-fuchsia-600 to-rose-500 flex items-center justify-center text-white shadow' },
+                e('i', { className: 'fa-solid fa-masks-theater text-lg' })
+              ),
+              e('div', { className: 'min-w-0' },
+                e('div', { className: 'flex items-center gap-2 flex-wrap' },
+                  e('h1', { className: 'text-sm sm:text-lg font-black text-slate-900' }, '송악고등학교 음악 연주와 창작 수행평가'),
+                  isOffline
+                    ? e('span', { className: 'text-2xs font-bold px-2 py-0.5 rounded-full bg-amber-50 text-amber-800 border border-amber-300 inline-flex items-center gap-1' },
+                        e('i', { className: 'fa-solid fa-plug-circle-xmark' }),
+                        e('span', null, OFFLINE_MODE ? '오프라인 모드' : '서버 응답 없음 · 오프라인'))
+                    : serverStatus === 'checking'
+                      ? e('span', { className: 'text-2xs font-bold px-2 py-0.5 rounded-full bg-slate-50 text-slate-600 border border-slate-200 hidden sm:inline-flex items-center gap-1' },
+                          e('i', { className: 'fa-solid fa-spinner fa-spin' }), e('span', null, '서버 확인 중'))
+                      : e('span', { className: 'text-2xs font-bold px-2 py-0.5 rounded-full bg-blue-50 text-blue-700 border border-blue-200 hidden sm:inline-flex items-center gap-1' },
+                          e('span', { className: 'w-1.5 h-1.5 rounded-full bg-blue-500 animate-pulse' }), e('span', null, '클라우드 실시간 연동'))
+                ),
+                e('p', { className: 'text-2xs sm:text-xs font-bold text-violet-700' }, '공연 활동 및 모둠 상호평가')
+              )
+            ),
+            e('div', { className: 'flex items-center gap-2 shrink-0' },
+              currentUser ? e('div', { className: 'flex items-center gap-2 bg-slate-100 px-3 py-1.5 rounded-xl text-xs font-bold' },
+                e('i', { className: 'fa-solid fa-user text-slate-500' }),
+                e('span', { className: 'hidden sm:inline' }, currentUser.name + ' (' + currentUser.id + ')'),
+                e('span', { className: 'sm:hidden' }, currentUser.name),
+                e('button', { onClick: handleLogout, className: 'text-slate-400 hover:text-rose-600 ml-1', title: '로그아웃' }, e('i', { className: 'fa-solid fa-right-from-bracket' }))
+              ) : e('button', { onClick: function() { setShowTeacherModal(true); }, className: 'px-3 py-1.5 rounded-xl border border-slate-200 text-slate-700 hover:bg-slate-50 text-xs font-bold flex items-center gap-1.5' },
+                e('i', { className: 'fa-solid fa-shield-halved text-purple-600' }),
+                e('span', { className: 'hidden sm:inline' }, '교사 관리자 모드'),
+                e('span', { className: 'sm:hidden' }, '교사')
+              )
+            )
+          ),
+          // 탭 바
+          e('div', { className: 'bg-slate-100 border-t border-slate-200 overflow-x-auto no-scrollbar' },
+            e('div', { className: 'max-w-7xl mx-auto px-4 flex items-center gap-1 min-w-max' },
+              e('button', { onClick: function() { setMainTab('activity'); }, className: 'flex items-center gap-2 py-3 px-3.5 text-xs sm:text-sm font-bold border-b-2 transition ' + (mainTab === 'activity' ? 'border-violet-600 text-violet-700 bg-white' : 'border-transparent text-slate-600') },
+                e('i', { className: 'fa-solid fa-music text-violet-600' }),
+                e('span', null, '공연 활동 및 모둠 상호평가')
+              ),
+              currentUser && currentUser.role === 'teacher' && e('button', { onClick: function() { setMainTab('teacher_dash'); fetchSubmissionsFromCloud(); }, className: 'flex items-center gap-2 py-3 px-3.5 text-xs sm:text-sm font-bold border-b-2 transition ml-auto ' + (mainTab === 'teacher_dash' ? 'border-purple-600 text-purple-700 bg-white' : 'border-transparent text-slate-600') },
+                e('i', { className: 'fa-solid fa-user-shield text-purple-600' }),
+                e('span', null, '교사 평가 관리 대시보드')
+              )
+            )
+          )
+        ),
+
+        // 점수 확정 안내 배너 (학생)
+        myConfirmed && e('div', { className: 'bg-emerald-100 border-b border-emerald-300 text-emerald-950 py-2.5 px-4' },
+          e('div', { className: 'max-w-7xl mx-auto flex items-center gap-2 text-xs' },
+            e('i', { className: 'fa-solid fa-circle-check text-emerald-600' }),
+            e('span', { className: 'font-bold' }, '선생님이 점수를 확정했습니다. 최종 점수 ' + myConfirmed.total + ' / ' + TOTAL_MAX + '점'),
+            e('button', { onClick: function() { setShowFinalPopup(true); }, className: 'ml-auto px-2.5 py-1 rounded-lg bg-emerald-600 text-white font-bold text-2xs whitespace-nowrap' }, '최종 점수 보기')
+          )
+        ),
+        // 제출 마감 안내 배너 (학생, 점수 확정 전)
+        myId && closedNow && !myConfirmed && e('div', { className: 'bg-rose-100 border-b border-rose-300 text-rose-950 py-2.5 px-4' },
+          e('div', { className: 'max-w-7xl mx-auto flex items-center gap-2 text-xs' },
+            e('i', { className: 'fa-solid fa-lock text-rose-600' }),
+            e('span', { className: 'font-bold' }, '제출이 마감되었습니다' + (portal.deadline && !portal.manual ? ' (' + formatDeadline(portal.deadline) + ')' : '') + '. 이제 제출한 내용과 점수만 확인할 수 있어요.')
+          )
+        ),
+        // 마감 예정 안내 (학생, 24시간 이내)
+        myId && !closedNow && portal.deadline &&
+          (new Date(portal.deadline).getTime() - (Date.now() + (portal.offset || 0)) < 24 * 3600 * 1000) &&
+          e('div', { className: 'bg-amber-50 border-b border-amber-200 text-amber-900 py-2 px-4' },
+            e('div', { className: 'max-w-7xl mx-auto flex items-center gap-2 text-xs font-bold' },
+              e('i', { className: 'fa-solid fa-clock text-amber-600' }),
+              e('span', null, '제출 마감: ' + formatDeadline(portal.deadline) + ' — 이 시각이 지나면 저장·제출이 되지 않아요. 미리 [최종 제출]을 눌러 두세요.')
+            )
+          ),
+        // 오프라인 안내 배너
+        isOffline && e('div', { className: 'bg-amber-100 border-b border-amber-300 text-amber-950 py-2.5 px-4' },
+          e('div', { className: 'max-w-7xl mx-auto flex items-start gap-2 text-xs' },
+            e('i', { className: 'fa-solid fa-triangle-exclamation text-amber-600 mt-0.5' }),
+            e('div', null,
+              e('p', { className: 'font-bold' }, !supabaseClient && !OFFLINE_MODE
+                ? '서버 주소가 아직 설정되지 않았습니다. (코드의 SUPABASE_URL과 SUPABASE_ANON_KEY를 새 프로젝트 값으로 바꿔 주세요)'
+                : OFFLINE_MODE ? '오프라인 모드: 서버에 접속하지 않고 이 기기에만 저장합니다.'
+                : '서버 응답이 없어 오프라인으로 전환했어요. 작성한 내용은 이 기기에 안전하게 저장됩니다.'),
+              e('p', { className: 'text-2xs text-amber-900/90 mt-0.5' },
+                currentUser && currentUser.role === 'teacher'
+                  ? '1분마다 서버를 다시 확인하고 있어요. 서버가 돌아오면 자동으로 연결되며, 그동안 채점·모둠 관리·학생 수정은 잠시 멈춥니다.'
+                  : '같은 기기·같은 브라우저에서 이어서 작성하세요. 서버가 돌아오면 자동으로 선생님께 전달됩니다. 브라우저 기록 삭제·시크릿 창은 사용하지 마세요.')
+            )
+          )
+        ),
+
+        // 미로그인 로그인 바
+        !currentUser && e('div', { className: 'bg-slate-900 text-white py-3 px-4 shadow-inner' },
+          e('div', { className: 'max-w-7xl mx-auto flex flex-col lg:flex-row items-center justify-between gap-3' },
+            e('div', { className: 'flex items-center gap-2 text-xs' },
+              e('i', { className: 'fa-solid fa-lock text-amber-400' }),
+              e('span', null, isRegisterMode ? '학번·성명·반·조·비밀번호(4자리)를 넣어 주세요. 반과 조는 등록한 뒤 바꿀 수 없어요.' : '학번과 비밀번호(4자리)로 로그인해 주세요. 처음이면 [최초 등록하기]를 누르세요.')
+            ),
+            isRegisterMode ? e('form', { onSubmit: handleStudentRegister, className: 'flex flex-wrap items-center justify-center gap-1.5' },
+              e('input', { type: 'text', inputMode: 'numeric', maxLength: 5, placeholder: '학번', value: studentIdInput, onChange: function(ev) {
+                setStudentIdInput(ev.target.value);
+                const gc = guessClassFromId(ev.target.value.trim());
+                if (gc) setRegisterClass(String(gc));
+              }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 w-20', required: true }),
+              e('input', { type: 'text', placeholder: '성명', value: studentNameInput, onChange: function(ev) { setStudentNameInput(ev.target.value); }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 w-20', required: true }),
+              e('select', { value: registerClass, onChange: function(ev) { setRegisterClass(ev.target.value); setRegisterGroup(''); }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 bg-white', required: true, title: '내 반 (등록 후 바꿀 수 없어요)' },
+                e('option', { value: '' }, '반 선택'),
+                CLASSES.map(function(c) { return e('option', { key: c, value: String(c) }, '2학년 ' + c + '반'); })
+              ),
+              e('select', { value: registerGroup, onChange: function(ev) { setRegisterGroup(ev.target.value); }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 bg-white', required: true, title: '내 조 (등록 후 바꿀 수 없어요)' },
+                e('option', { value: '' }, '조 선택'),
+                GROUPS.map(function(g) { return e('option', { key: g, value: String(g) }, g + '조'); })
+              ),
+              e('input', { type: 'password', inputMode: 'numeric', maxLength: 4, placeholder: '비번 4자리', value: studentPwInput, onChange: function(ev) { setStudentPwInput(ev.target.value); }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 w-24', required: true }),
+              e('button', { type: 'submit', disabled: authBusy, className: 'px-3 py-1.5 rounded bg-emerald-600 text-white font-bold text-xs ' + (authBusy ? 'opacity-60 cursor-wait' : '') }, authBusy ? '확인 중…' : '등록 완료'),
+              e('button', { type: 'button', onClick: function() { setIsRegisterMode(false); }, className: 'text-2xs text-slate-300 underline ml-1' }, '로그인으로')
+            ) : e('form', { onSubmit: handleStudentLogin, className: 'flex flex-wrap items-center justify-center gap-1.5' },
+              e('input', { type: 'text', inputMode: 'numeric', maxLength: 5, placeholder: '학번', value: studentIdInput, onChange: function(ev) { setStudentIdInput(ev.target.value); }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 w-24', required: true }),
+              e('input', { type: 'password', inputMode: 'numeric', maxLength: 4, placeholder: '비밀번호 4자리', value: studentPwInput, onChange: function(ev) { setStudentPwInput(ev.target.value); }, className: 'px-2 py-1.5 rounded text-xs text-slate-900 w-28', required: true }),
+              e('button', { type: 'submit', disabled: authBusy, className: 'px-3 py-1.5 rounded bg-violet-600 text-white font-bold text-xs ' + (authBusy ? 'opacity-60 cursor-wait' : '') }, authBusy ? '확인 중…' : '로그인'),
+              e('button', { type: 'button', onClick: function() { setIsRegisterMode(true); }, className: 'px-2 py-1.5 rounded bg-slate-800 text-amber-300 font-bold text-xs' }, '최초 등록하기')
+            )
+          ),
+          // 등록할 때 내 조 찾기 도우미: 고른 반의 공연 제목·조원 이름 (영상은 보이지 않음)
+          isRegisterMode && e('div', { className: 'max-w-7xl mx-auto mt-3' },
+            !registerClass
+              ? e('p', { className: 'text-2xs text-slate-300' }, '반을 고르면 그 반의 모둠 목록(공연 제목·조원 이름)이 나타나요. 몇 조인지 모르면 여기서 찾아 눌러 주세요.')
+              : e('div', null,
+                  e('p', { className: 'text-2xs text-slate-300 mb-1.5' }, registerClass + '반 모둠 목록 — 내 조를 눌러 주세요'),
+                  e('div', { className: 'grid grid-cols-2 sm:grid-cols-5 gap-1.5' },
+                    GROUPS.map(function(g) {
+                      const row = regGroups.filter(function(r) { return Number(r.group_no) === g; })[0] || {};
+                      const on = Number(registerGroup) === g;
+                      return e('button', { key: g, type: 'button', onClick: function() { setRegisterGroup(String(g)); },
+                        className: 'p-2 rounded-lg text-left border ' + (on ? 'bg-emerald-600 border-emerald-500' : 'bg-slate-800 border-slate-700 hover:border-slate-500') },
+                        e('p', { className: 'text-xs font-black' }, g + '조'),
+                        e('p', { className: 'text-2xs font-bold text-slate-200' }, row.title || '공연 제목 미등록'),
+                        row.members && e('p', { className: 'text-2xs text-slate-400 mt-0.5 leading-snug' }, row.members)
+                      );
+                    })
+                  )
+                )
+          )
+        ),
+
+        // 본문
+        e('main', { className: 'max-w-7xl mx-auto px-4 py-6 w-full flex-1' },
+          mainTab === 'activity' && renderActivityTab(),
+          mainTab === 'teacher_dash' && currentUser && currentUser.role === 'teacher' && renderTeacherDash()
+        ),
+
+        gradingStudentId && currentUser && currentUser.role === 'teacher' && renderGradingModal(),
+        groupEvalViewer && currentUser && currentUser.role === 'teacher' && renderGroupEvalModal(),
+
+        // [교사] 제출 마감 설정 창
+        showDeadlineModal && currentUser && currentUser.role === 'teacher' && e('div', { className: 'fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm overflow-y-auto' },
+          e('div', { className: 'bg-white rounded-3xl border border-slate-200 p-6 max-w-md w-full space-y-4 shadow-2xl text-xs' },
+            e('div', { className: 'flex items-center justify-between pb-2 border-b' },
+              e('div', { className: 'flex items-center gap-2' },
+                e('i', { className: 'fa-solid fa-clock text-amber-600' }),
+                e('h3', { className: 'text-sm font-black text-slate-900' }, '제출 마감 설정')
+              ),
+              e('button', { onClick: function() { setShowDeadlineModal(false); }, className: 'text-slate-400 hover:text-slate-600' }, e('i', { className: 'fa-solid fa-xmark text-lg' }))
+            ),
+            e('div', { className: 'p-3 rounded-xl flex items-center gap-2 font-bold ' + (closedNow ? 'bg-rose-50 text-rose-800 border border-rose-200' : 'bg-emerald-50 text-emerald-800 border border-emerald-200') },
+              e('i', { className: 'fa-solid ' + (closedNow ? 'fa-lock' : 'fa-lock-open') }),
+              e('span', null, closedNow
+                ? ('지금 마감 상태입니다' + (portal.manual ? ' (수동 마감)' : portal.deadline ? ' (' + formatDeadline(portal.deadline) + ' 자동 마감)' : ''))
+                : (portal.deadline ? '제출 가능 · ' + formatDeadline(portal.deadline) + '에 자동 마감' : '제출 가능 · 마감 시각이 정해지지 않았습니다'))
+            ),
+            !portal.known && e('p', { className: 'text-2xs text-amber-700' }, '서버의 마감 정보를 아직 받지 못했습니다. 통합 SQL을 실행했는지, 서버가 연결되었는지 확인해 주세요.'),
+            e('p', { className: 'text-2xs text-slate-500 leading-relaxed' }, '마감되면 학생은 작성·수정·제출을 할 수 없고, 제출한 내용과 점수만 볼 수 있어요. 마감 직전에 창을 열어 둔 학생도 마감 시각이 지나면 저장되지 않습니다(서버 시각 기준). 선생님의 채점·모둠 관리는 마감 뒤에도 계속할 수 있어요.'),
+            e('div', null,
+              e('label', { className: 'block font-bold text-slate-700 mb-1' }, '자동 마감 날짜와 시간'),
+              e('input', { type: 'datetime-local', value: deadlineInput, onChange: function(ev) { setDeadlineInput(ev.target.value); }, className: 'w-full p-2.5 border rounded-xl text-xs' })
+            ),
+            e('div', null,
+              e('label', { className: 'block font-bold text-slate-700 mb-1' }, '교사 비밀번호 (확인용)'),
+              e('input', { type: 'password', maxLength: 6, value: deadlinePw, onChange: function(ev) { setDeadlinePw(ev.target.value); }, placeholder: '6자리 숫자', className: 'w-full p-2.5 border rounded-xl text-xs font-mono tracking-widest' })
+            ),
+            e('div', { className: 'grid grid-cols-2 gap-2' },
+              e('button', { onClick: function() { setPortalByTeacher('set_deadline'); }, disabled: deadlineBusy, className: 'col-span-2 py-2.5 rounded-xl bg-amber-600 hover:bg-amber-700 text-white font-bold shadow ' + (deadlineBusy ? 'opacity-60 cursor-wait' : '') }, deadlineBusy ? '저장 중…' : '이 시각에 자동 마감'),
+              e('button', { onClick: function() { setPortalByTeacher('close_now'); }, disabled: deadlineBusy, className: 'py-2.5 rounded-xl bg-rose-600 hover:bg-rose-700 text-white font-bold shadow' }, '지금 바로 마감'),
+              e('button', { onClick: function() { setPortalByTeacher('reopen'); }, disabled: deadlineBusy, className: 'py-2.5 rounded-xl border border-emerald-400 text-emerald-700 hover:bg-emerald-50 font-bold' }, '다시 열기'),
+              portal.deadline && !closedNow && e('button', { onClick: function() { setPortalByTeacher('clear_deadline'); }, disabled: deadlineBusy, className: 'col-span-2 py-2 rounded-xl text-slate-500 hover:bg-slate-100 font-bold' }, '자동 마감 시각 지우기')
+            )
+          )
+        ),
+
+        // [교사] 학생 정보 편집 및 삭제 창
+        editingStudentModal && editingStudentTargetId && e('div', { className: 'fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm' },
+          e('div', { className: 'bg-white rounded-3xl border border-slate-200 p-6 max-w-md w-full space-y-4 shadow-2xl' },
+            e('div', { className: 'flex items-center justify-between pb-3 border-b border-slate-100' },
+              e('div', { className: 'flex items-center gap-2' },
+                e('div', { className: 'w-7 h-7 rounded-lg bg-rose-600 text-white flex items-center justify-center text-xs' }, e('i', { className: 'fa-solid fa-user-gear' })),
+                e('div', null,
+                  e('h3', { className: 'text-sm font-black text-slate-900' }, '학생 개별 정보 편집 및 삭제'),
+                  e('p', { className: 'text-2xs text-slate-500' }, '학번·성명·반·조를 고치거나, 이 학생의 모든 기록을 삭제합니다.')
+                )
+              ),
+              e('button', { onClick: function() { setEditingStudentModal(false); setEditingStudentTargetId(null); }, className: 'text-slate-400 hover:text-slate-600' }, e('i', { className: 'fa-solid fa-xmark text-lg' }))
+            ),
+            e('form', { onSubmit: saveStudentInfoEdit, className: 'space-y-3.5 text-xs' },
+              e('div', { className: 'grid grid-cols-2 gap-2' },
+                e('div', null,
+                  e('label', { className: 'block font-bold text-slate-700 mb-1' }, '학번 (숫자 4~5자리)'),
+                  e('input', { type: 'text', maxLength: 5, value: editingStudentForm.id, onChange: function(ev) { setEditingStudentForm(Object.assign({}, editingStudentForm, { id: ev.target.value })); }, className: 'w-full p-2.5 border rounded-xl font-mono text-xs', required: true })
+                ),
+                e('div', null,
+                  e('label', { className: 'block font-bold text-slate-700 mb-1' }, '성명'),
+                  e('input', { type: 'text', value: editingStudentForm.name, onChange: function(ev) { setEditingStudentForm(Object.assign({}, editingStudentForm, { name: ev.target.value })); }, className: 'w-full p-2.5 border rounded-xl text-xs', required: true })
+                ),
+                e('div', null,
+                  e('label', { className: 'block font-bold text-slate-700 mb-1' }, '반'),
+                  e('select', { value: editingStudentForm.classNo, onChange: function(ev) { setEditingStudentForm(Object.assign({}, editingStudentForm, { classNo: ev.target.value })); }, className: 'w-full p-2.5 border rounded-xl text-xs bg-white' },
+                    e('option', { value: '' }, '미선택'), CLASSES.map(function(c) { return e('option', { key: c, value: String(c) }, c + '반'); }))
+                ),
+                e('div', null,
+                  e('label', { className: 'block font-bold text-slate-700 mb-1' }, '조'),
+                  e('select', { value: editingStudentForm.groupNo, onChange: function(ev) { setEditingStudentForm(Object.assign({}, editingStudentForm, { groupNo: ev.target.value })); }, className: 'w-full p-2.5 border rounded-xl text-xs bg-white' },
+                    e('option', { value: '' }, '미선택'), GROUPS.map(function(g) { return e('option', { key: g, value: String(g) }, g + '조'); }))
+                )
+              ),
+              e('p', { className: 'text-2xs text-slate-500' }, '※ 조를 바꾸면 모둠 점수도 새 조의 점수로 바뀝니다. 비밀번호는 그대로 유지됩니다.'),
+              e('div', { className: 'pt-2 flex items-center justify-between gap-2' },
+                e('button', { type: 'button', onClick: deleteSingleStudent, className: 'px-3.5 py-2 rounded-xl bg-rose-50 hover:bg-rose-100 text-rose-700 font-bold border border-rose-200 transition flex items-center gap-1.5' },
+                  e('i', { className: 'fa-solid fa-trash-can' }), e('span', null, '이 학생 기록 삭제')),
+                e('div', { className: 'flex items-center gap-1.5' },
+                  e('button', { type: 'button', onClick: function() { setEditingStudentModal(false); setEditingStudentTargetId(null); }, className: 'px-3 py-2 rounded-xl border text-slate-600 hover:bg-slate-50 font-bold' }, '취소'),
+                  e('button', { type: 'submit', className: 'px-4 py-2 rounded-xl bg-slate-900 hover:bg-slate-800 text-white font-bold shadow' }, '정보 수정 저장')
+                )
+              )
+            )
+          )
+        ),
+
+        // 교사 로그인 창
+        showTeacherModal && e('div', { className: 'fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-900/60 backdrop-blur-sm' },
+          e('div', { className: 'bg-white rounded-3xl border border-slate-200 p-6 max-w-sm w-full space-y-4 shadow-2xl' },
+            e('div', { className: 'flex items-center justify-between pb-2 border-b' },
+              e('div', { className: 'flex items-center gap-2' },
+                e('i', { className: 'fa-solid fa-shield-halved text-purple-600' }),
+                e('h3', { className: 'text-sm font-black text-slate-900' }, '교사 관리자 모드 접속')
+              ),
+              e('button', { onClick: function() { setShowTeacherModal(false); }, className: 'text-slate-400 hover:text-slate-600' }, e('i', { className: 'fa-solid fa-xmark text-lg' }))
+            ),
+            e('form', { onSubmit: handleTeacherLogin, className: 'space-y-3' },
+              e('input', { type: 'text', placeholder: '교사 아이디', value: teacherIdInput, onChange: function(ev) { setTeacherIdInput(ev.target.value); }, className: 'w-full px-3 py-2 text-xs border rounded-xl font-mono', required: true }),
+              e('input', { type: 'password', maxLength: 6, placeholder: '비밀번호 6자리 숫자', value: teacherPwInput, onChange: function(ev) { setTeacherPwInput(ev.target.value); }, className: 'w-full px-3 py-2 text-xs border rounded-xl font-mono tracking-widest', required: true }),
+              e('button', { type: 'submit', disabled: authBusy, className: 'w-full py-2.5 rounded-xl bg-purple-600 text-white font-bold text-xs shadow ' + (authBusy ? 'opacity-60 cursor-wait' : '') }, authBusy ? '확인 중…' : '관리자 로그인')
+            )
+          )
+        )
+      );
+    }
+
+    ReactDOM.createRoot(document.getElementById('root')).render(e(App));
+  </script>
+</body>
+</html><!DOCTYPE html>
+<html lang="ko">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>송악고등학교 음악 연주와 창작 수행평가</title>
+  <!-- Tailwind CSS CDN -->
+  <script src="https://cdn.tailwindcss.com"></script>
+  <!-- React 18 & ReactDOM CDN -->
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <!-- Supabase JS Client CDN -->
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <!-- FontAwesome 6 -->
+  <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.5.1/css/all.min.css" />
+  <!-- Pretendard Font -->
+  <link rel="stylesheet" href="https://cdn.jsdelivr.net/gh/orioncactus/pretendard/dist/web/static/pretendard.css" />
+  <style>
+    body { font-family: 'Pretendard', sans-serif; }
+    .no-scrollbar::-webkit-scrollbar { display: none; }
+    .no-scrollbar { -ms-overflow-style: none; scrollbar-width: none; }
+    .text-2xs { font-size: 0.6875rem; line-height: 0.95rem; }
+    textarea::placeholder, input::placeholder {
+      color: #94a3b8;
+      opacity: 0.75;
+      font-weight: 400;
+    }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 antialiased selection:bg-violet-500 selection:text-white">
+  <div id="root"></div>
+
+  <script>
+    const e = React.createElement;
+    const { useState, useEffect, useMemo, useRef } = React;
+
+    // =========================================================
+    // ★ 서버 스위치 (비상용) ★
+    //   false = 자동 모드 (평소): 서버 응답이 8초 넘게 없으면 각 기기가 스스로 오프라인으로 바뀌고,
+    //           1분마다 서버를 다시 확인해 돌아오면 자동으로 온라인 복귀 + 기기에 쌓인 기록 전달
+    //   true  = 강제 오프라인: 서버에 아예 접속하지 않음 (서버를 일부러 쉬게 하고 싶을 때만)
+    // =========================================================
+    const OFFLINE_MODE = false;
+
+    // --- Supabase 클라우드 DB 클라이언트 초기화 ---
+    // ▼▼▼ 새 Supabase 프로젝트의 Project URL과 Publishable(anon) key로 바꿔 주세요 ▼▼▼
+    const SUPABASE_URL = 'https://sndubacqffibxxdodjbe.supabase.co';
+    const SUPABASE_ANON_KEY = 'sb_publishable_NGLrFiTX8EPBsbjrbktnUQ_x8HvuFxm';
+    let supabaseClient = null;
+    try {
+      if (!OFFLINE_MODE && window.supabase && /^https:\/\/[a-z0-9-]+\.supabase\.co$/i.test(SUPABASE_URL)) {
+        // 이 포털은 Supabase 로그인 기능을 쓰지 않으므로 세션 저장·자동 갱신·브라우저 잠금을 모두 끔
+        supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+          auth: {
+            persistSession: false,
+            autoRefreshToken: false,
+            detectSessionInUrl: false,
+            storageKey: 'perf-portal-no-auth',
+            lock: async function(name, acquireTimeout, fn) { return await fn(); }
+          }
+        });
+      }
+    } catch (err) {
+      console.error('Supabase Init Error:', err);
+    }
+
+    // 클라우드 응답이 없을 때 무한정 기다리지 않도록 시간 제한 (기본 30초: 서버가 느릴 때도 기다려 줌)
+    function withTimeout(promise, ms) {
+      return Promise.race([
+        promise,
+        new Promise(function(_, reject) {
+          setTimeout(function() { reject(new Error('TIMEOUT')); }, ms || 30000);
+        })
+      ]);
+    }
+
+    // 서버에 닿지 못한 실패인지 판별 (시간 초과·네트워크 오류). 서버가 돌려준 오류(권한 등)는 해당 없음
+    function isNetworkFailure(errOrRes) {
+      if (!errOrRes) return false;
+      const err = errOrRes.error !== undefined ? errOrRes.error : errOrRes;
+      if (!err) return false;
+      if (err.message === 'TIMEOUT') return true;
+      const msg = String(err.message || '');
+      if (/Failed to fetch|NetworkError|Load failed|network/i.test(msg)) return true;
+      return errOrRes.error !== undefined && !err.code;
+    }
+
+    const SERVER_CHECK_MS = 8000;
+    // 서버가 "마감되어 거부"한 오류인지
+    function isDeadlineError(err) {
+      const e0 = err && err.error !== undefined ? err.error : err;
+      return !!e0 && /DEADLINE_CLOSED/.test(String(e0.message || ''));
+    }
+
+    function isConfirmedLockError(err) {
+      const e0 = err && err.error !== undefined ? err.error : err;
+      return !!e0 && /CONFIRMED_LOCKED/.test(String(e0.message || ''));
+    }
+    // 마감 시각을 사람이 읽는 형태로 (예: 11월 14일 (금) 오전 12:00)
+    function formatDeadline(iso) {
+      if (!iso) return '';
+      try {
+        return new Date(iso).toLocaleString('ko-KR', { month: 'long', day: 'numeric', weekday: 'short', hour: 'numeric', minute: '2-digit' });
+      } catch (err) { return String(iso); }
+    }
+
+    // datetime-local 입력칸용 값 (이 컴퓨터의 시간대 기준)
+    function toLocalInputValue(iso) {
+      if (!iso) return '';
+      const d = new Date(iso);
+      const pad = function(n) { return String(n).padStart(2, '0'); };
+      return d.getFullYear() + '-' + pad(d.getMonth() + 1) + '-' + pad(d.getDate()) + 'T' + pad(d.getHours()) + ':' + pad(d.getMinutes());
+    }
+    // 기기 저장 공간이 가득 차도 화면이 멈추지 않도록 (성공하면 true)
+    function safeSetLocal(key, value) {
+      try {
+        localStorage.setItem(key, value);
+        return true;
+      } catch (err) {
+        console.error('Local Storage Error:', err);
+        return false;
+      }
+    }
+
+    function loadLocalSubmissions() {
+      try {
+        const s = localStorage.getItem('perf_submissions');
+        return s ? JSON.parse(s) : {};
+      } catch (err) { return {}; }
+    }
+
+    // 아직 클라우드로 전달하지 못한 학생 학번 목록 (오프라인 모드에서 저장했거나 전송에 실패한 경우)
+    function getPendingSync() {
+      try {
+        const s = localStorage.getItem('perf_pending_sync');
+        return s ? JSON.parse(s) : [];
+      } catch (err) { return []; }
+    }
+    function addPendingSync(id) {
+      const list = getPendingSync();
+      if (list.indexOf(String(id)) === -1) list.push(String(id));
+      safeSetLocal('perf_pending_sync', JSON.stringify(list));
+    }
+    function removePendingSync(id) {
+      safeSetLocal('perf_pending_sync', JSON.stringify(getPendingSync().filter(function(x) { return x !== String(id); })));
+    }
+    const XLSX_STYLES = '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+      '<styleSheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main">' +
+      '<fonts count="3">' +
+        '<font><sz val="10"/><name val="맑은 고딕"/><family val="2"/></font>' +
+        '<font><b/><sz val="10"/><name val="맑은 고딕"/><family val="2"/></font>' +
+        '<font><b/><sz val="10"/><color rgb="FFC00000"/><name val="맑은 고딕"/><family val="2"/></font>' +
+      '</fonts>' +
+      '<fills count="4">' +
+        '<fill><patternFill patternType="none"/></fill>' +
+        '<fill><patternFill patternType="gray125"/></fill>' +
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFDCE6F1"/><bgColor indexed="64"/></patternFill></fill>' +
+        '<fill><patternFill patternType="solid"><fgColor rgb="FFFFE699"/><bgColor indexed="64"/></patternFill></fill>' +
+      '</fills>' +
+      '<borders count="2">' +
+        '<border><left/><right/><top/><bottom/><diagonal/></border>' +
+        '<border><left style="thin"><color rgb="FFBFBFBF"/></left><right style="thin"><color rgb="FFBFBFBF"/></right><top style="thin"><color rgb="FFBFBFBF"/></top><bottom style="thin"><color rgb="FFBFBFBF"/></bottom><diagonal/></border>' +
+      '</borders>' +
+      '<cellStyleXfs count="1"><xf numFmtId="0" fontId="0" fillId="0" borderId="0"/></cellStyleXfs>' +
+      '<cellXfs count="7">' +
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="0" xfId="0"/>' +
+        '<xf numFmtId="0" fontId="1" fillId="2" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="center" wrapText="1"/></xf>' +
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>' +
+        '<xf numFmtId="0" fontId="0" fillId="3" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>' +
+        '<xf numFmtId="0" fontId="0" fillId="0" borderId="1" xfId="0" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top"/></xf>' +
+        '<xf numFmtId="0" fontId="0" fillId="3" borderId="1" xfId="0" applyFill="1" applyBorder="1" applyAlignment="1"><alignment horizontal="center" vertical="top"/></xf>' +
+        '<xf numFmtId="0" fontId="2" fillId="3" borderId="1" xfId="0" applyFont="1" applyFill="1" applyBorder="1" applyAlignment="1"><alignment vertical="top" wrapText="1"/></xf>' +
+      '</cellXfs>' +
+      '<cellStyles count="1"><cellStyle name="Normal" xfId="0" builtinId="0"/></cellStyles>' +
+      '</styleSheet>';
+
+    function xlsxColName(i) {
+      let n = i + 1, out = '';
+      while (n > 0) { const m = (n - 1) % 26; out = String.fromCharCode(65 + m) + out; n = Math.floor((n - 1) / 26); }
+      return out;
+    }
+
+    function xlsxEscape(v) {
+      return String(v)
+        .replace(/[\u0000-\u0008\u000B\u000C\u000E-\u001F]/g, '')
+        .replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;')
+        .slice(0, 32000);
+    }
+
+    // sheet = { name, widths: [열 너비...], rows: [[{ v: 값, s: 스타일 번호 }, ...], ...] } (첫 줄은 머리글로 고정)
+    function xlsxSheetXml(sheet) {
+      const cols = sheet.widths.map(function(w, i) {
+        return '<col min="' + (i + 1) + '" max="' + (i + 1) + '" width="' + w + '" customWidth="1"/>';
+      }).join('');
+      const rows = sheet.rows.map(function(row, r) {
+        const cells = row.map(function(cell, c) {
+          const ref = xlsxColName(c) + (r + 1);
+          const st = cell && cell.s ? ' s="' + cell.s + '"' : '';
+          const v = cell ? cell.v : '';
+          if (v === null || v === undefined || v === '') return '<c r="' + ref + '"' + st + '/>';
+          if (typeof v === 'number' && isFinite(v)) return '<c r="' + ref + '"' + st + '><v>' + v + '</v></c>';
+          return '<c r="' + ref + '"' + st + ' t="inlineStr"><is><t xml:space="preserve">' + xlsxEscape(v) + '</t></is></c>';
+        }).join('');
+        return '<row r="' + (r + 1) + '">' + cells + '</row>';
+      }).join('');
+      return '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
+        '<worksheet xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships">' +
+        '<sheetViews><sheetView workbookViewId="0"><pane ySplit="1" topLeftCell="A2" activePane="bottomLeft" state="frozen"/></sheetView></sheetViews>' +
+        '<sheetFormatPr defaultRowHeight="15"/>' +
+        '<cols>' + cols + '</cols>' +
+        '<sheetData>' + rows + '</sheetData>' +
+        (sheet.rows.length > 1 ? '<autoFilter ref="A1:' + xlsxColName(sheet.widths.length - 1) + sheet.rows.length + '"/>' : '') +
+        '</worksheet>';
+    }
+
+    let CRC_TABLE = null;
+    function crc32(bytes) {
+      if (!CRC_TABLE) {
+        CRC_TABLE = new Uint32Array(256);
+        for (let n = 0; n < 256; n++) {
+          let c = n;
+          for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+          CRC_TABLE[n] = c >>> 0;
+        }
+      }
+      let crc = 0xFFFFFFFF;
+      for (let i = 0; i < bytes.length; i++) crc = CRC_TABLE[(crc ^ bytes[i]) & 0xFF] ^ (crc >>> 8);
+      return (crc ^ 0xFFFFFFFF) >>> 0;
+    }
+
+    // 압축하지 않는 zip (엑셀 파일은 zip 안에 xml 파일들이 들어 있는 형식)
+    function zipStore(files) {
+      const enc = new TextEncoder();
+      const parts = [], central = [];
+      let offset = 0;
+      const u16 = function(v) { return [v & 0xFF, (v >>> 8) & 0xFF]; };
+      const u32 = function(v) { return [v & 0xFF, (v >>> 8) & 0xFF, (v >>> 16) & 0xFF, (v >>> 24) & 0xFF]; };
+      files.forEach(function(f) {
+        const name = enc.encode(f.name);
+        const data = enc.encode(f.data);
+        const crc = crc32(data);
+        const local = [].concat([0x50, 0x4B, 0x03, 0x04], u16(20), u16(0x0800), u16(0), u16(0), u16(0x21), u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0));
+        parts.push(new Uint8Array(local), name, data);
+        const cen = [].concat([0x50, 0x4B, 0x01, 0x02], u16(20), u16(20), u16(0x0800), u16(0), u16(0), u16(0x21), u32(crc), u32(data.length), u32(data.length), u16(name.length), u16(0), u16(0), u16(0), u16(0), u32(0), u32(offset));
+        central.push(new Uint8Array(cen), name);
+        offset += local.length + name.length + data.length;
+      });
+      const cenSize = central.reduce(function(a, b) { return a + b.length; }, 0);
+      const end = new Uint8Array([].concat([0x50, 0x4B, 0x05, 0x06], u16(0), u16(0), u16(files.length), u16(files.length), u32(cenSize), u32(offset), u16(0)));
+      const all = parts.concat(central, [end]);
+      const total = all.reduce(function(a, b) { return a + b.length; }, 0);
+      const out = new Uint8Array(total);
+      let pos = 0;
+      all.forEach(function(b) { out.set(b, pos); pos += b.length; });
+      return out;
+    }
+
+    function buildXlsxBytes(sheets) {
+      const files = [
+        { name: '[Content_Types].xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Types xmlns="http://schemas.openxmlformats.org/package/2006/content-types"><Default Extension="rels" ContentType="application/vnd.openxmlformats-package.relationships+xml"/><Default Extension="xml" ContentType="application/xml"/><Override PartName="/xl/workbook.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml"/><Override PartName="/xl/styles.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.styles+xml"/>' +
+          sheets.map(function(sh, i) { return '<Override PartName="/xl/worksheets/sheet' + (i + 1) + '.xml" ContentType="application/vnd.openxmlformats-officedocument.spreadsheetml.worksheet+xml"/>'; }).join('') + '</Types>' },
+        { name: '_rels/.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships"><Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="xl/workbook.xml"/></Relationships>' },
+        { name: 'xl/workbook.xml', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><workbook xmlns="http://schemas.openxmlformats.org/spreadsheetml/2006/main" xmlns:r="http://schemas.openxmlformats.org/officeDocument/2006/relationships"><bookViews><workbookView/></bookViews><sheets>' +
+          sheets.map(function(sh, i) { return '<sheet name="' + xlsxEscape(sh.name) + '" sheetId="' + (i + 1) + '" r:id="rId' + (i + 1) + '"/>'; }).join('') + '</sheets>' +
+          (function() {
+            const names = sheets.map(function(sh, i) { return sh.rows.length > 1 ? '<definedName name="_xlnm._FilterDatabase" localSheetId="' + i + '" hidden="1">\'' + xlsxEscape(sh.name) + '\'!$A$1:$' + xlsxColName(sh.widths.length - 1) + '$' + sh.rows.length + '</definedName>' : ''; }).join('');
+            return names ? '<definedNames>' + names + '</definedNames>' : '';
+          })() +
+          '</workbook>' },
+        { name: 'xl/_rels/workbook.xml.rels', data: '<?xml version="1.0" encoding="UTF-8" standalone="yes"?><Relationships xmlns="http://schemas.openxmlformats.org/package/2006/relationships">' +
+          sheets.map(function(sh, i) { return '<Relationship Id="rId' + (i + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/worksheet" Target="worksheets/sheet' + (i + 1) + '.xml"/>'; }).join('') +
+          '<Relationship Id="rId' + (sheets.length + 1) + '" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles" Target="styles.xml"/></Relationships>' },
+        { name: 'xl/styles.xml', data: XLSX_STYLES }
+      ];
+      sheets.forEach(function(sh, i) { files.push({ name: 'xl/worksheets/sheet' + (i + 1) + '.xml', data: xlsxSheetXml(sh) }); });
+      return zipStore(files);
+    }
+
+    // =========================================================
+    // [공연 활동 및 모둠 상호평가] 기본 정보
+    // =========================================================
+    const CLASSES = [5, 6, 7, 8];          // 2학년 5~8반
+    const GROUPS = [1, 2, 3, 4, 5];        // 반마다 1~5조
+    const ROLES = [
+      { key: 'lead', label: '총괄', desc: '공연 구성·순서 배치', example: '예) 느린 곡과 빠른 곡을 번갈아 배치해 공연 흐름이 끊기지 않도록 순서를 정했다.' },
+      { key: 'cuesheet', label: '큐시트 제작', desc: '프로그램 안내지 제작', example: '예) 팀별 공연 제목과 출연자, 순서를 정리해 한눈에 보이는 프로그램 안내지를 만들었다.' },
+      { key: 'editor', label: '영상 편집자', desc: '제출 영상 최종 편집', example: '예) 팀별 영상의 소리 크기를 맞추고 자막을 넣어 하나의 공연 영상으로 편집했다.' }
+    ];
+    const PERF_TYPES = ['개인 노래', '개인 춤', '개인 연주', '모둠 노래', '모둠 춤', '모둠 연주', '기타 (직접 입력)'];
+    const PERF_ETC = '기타 (직접 입력)';
+    const PERF_MIN_LEN = 50; // 2번(개인 활동) 모든 칸을 더한 최소 글자 수
+    const EVAL_MIN_LEN = 50; // 4번(다른 모둠 평가) 한 모둠당 4칸을 더한 최소 글자 수
+    // 2번 아래쪽 공통 칸
+    const REFLECT_FIELDS = [
+      { key: 'difficulty', label: '어려웠던 점과 해결 과정', ph: '공연이나 연습 과정에서 어려웠던 점과, 그것을 해결하려고 어떻게 노력했는지 적어 주세요.' },
+      { key: 'episode', label: '기억에 남는 에피소드', ph: '준비하거나 공연하면서 기억에 남는 일, 친구들과 있었던 일을 적어 주세요.' },
+      { key: 'completion', label: '공연 완성도 (스스로 돌아보기)', ph: '내 공연이 얼마나 완성도 있었는지, 잘된 점과 아쉬운 점을 솔직하게 적어 주세요.' }
+    ];
+    // 4번 평가 칸
+    const EVAL_FIELDS = [
+      { key: 'art', label: '예술성', ph: '표현력, 음악·동작의 완성도, 무대의 아름다움 등' },
+      { key: 'orig', label: '독창성', ph: '새로운 아이디어, 그 모둠만의 개성 등' },
+      { key: 'improve', label: '개선점', ph: '더 좋아지려면 무엇을 바꾸면 좋을지' },
+      { key: 'etc', label: '기타 의견', ph: '응원, 인상 깊었던 장면 등 하고 싶은 말' }
+    ];
+
+    // 채점 기준 (점수 선택지)
+    const SCORE_ITEMS = [
+      { key: 'plan', label: '공연 기획하기', area: '모둠 평가', max: 20, options: [20, 10] },
+      { key: 'perform', label: '공연하기', area: '모둠 평가', max: 30, options: [30, 20, 10] },
+      { key: 'participation', label: '공연 참여 과정', area: '개인 평가', max: 10, options: [10, 0] },
+      { key: 'review', label: '감상평 작성하기', area: '개인 평가', max: 40, options: [40, 30, 20] }
+    ];
+    const TOTAL_MAX = 100;
+
+    const groupKey = function(c, g) { return c + '-' + g; };
+    const isNum = function(v) { return typeof v === 'number' && isFinite(v); };
+    const tlen = function(v) { return String(v || '').trim().length; };
+
+    // 학번으로 반 짐작하기 (예: 2514 → 5반, 20514 → 5반). 맞지 않으면 null
+    function guessClassFromId(id) {
+      const s = String(id || '');
+      let c = null;
+      if (/^2\d{3}$/.test(s)) c = Number(s[1]);
+      else if (/^2\d{4}$/.test(s)) c = Number(s.slice(1, 3));
+      return CLASSES.indexOf(c) !== -1 ? c : null;
+    }
+
+    // 유튜브 주소에서 영상 번호 찾기 (없으면 null)
+    function youtubeId(url) {
+      const m = String(url || '').match(/(?:youtu\.be\/|[?&]v=|\/embed\/|\/shorts\/|\/live\/)([\w-]{11})/);
+      return m ? m[1] : null;
+    }
+
+    // 선생님이 쉼표로 적은 조원 이름 → 이름 목록
+    function splitMembers(text) {
+      return String(text || '').split(/[,，、\n]+/).map(function(x) { return x.trim(); }).filter(function(x) { return x; })
+        .filter(function(x, i, arr) { return arr.indexOf(x) === i; });
+    }
+
+    function emptyAct() {
+      return {
+        roles: { lead: false, cuesheet: false, editor: false },
+        roleDetails: { lead: '', cuesheet: '', editor: '' },
+        perfTypes: [],
+        perfEtc: '',
+        perfDetails: {},
+        difficulty: '',
+        episode: '',
+        completion: '',
+        peerChecks: {},
+        peerIssue: '',
+        evals: {}
+      };
+    }
+
+    function roleLabels(act) {
+      const r = (act && act.roles) || {};
+      return ROLES.filter(function(x) { return r[x.key]; }).map(function(x) { return x.label; });
+    }
+
+    function perfTypeName(t, act) {
+      return t === PERF_ETC ? ('기타: ' + ((act && act.perfEtc) || '')) : t;
+    }
+    function perfTypeText(act) {
+      if (!act || !act.perfTypes || !act.perfTypes.length) return '';
+      return act.perfTypes.map(function(t) { return perfTypeName(t, act); }).join(', ');
+    }
+
+    // 2번 전체 글자 수 (고른 형태의 공연 내용·과정 + 공통 3칸)
+    function perfTextLength(act) {
+      if (!act) return 0;
+      let n = 0;
+      (act.perfTypes || []).forEach(function(t) {
+        const d = (act.perfDetails || {})[t] || {};
+        n += tlen(d.what) + tlen(d.process);
+      });
+      REFLECT_FIELDS.forEach(function(f) { n += tlen(act[f.key]); });
+      return n;
+    }
+
+    // 다른 모둠 평가 한 개의 글자 수 (4칸 합계)
+    function evalTextLength(ev) {
+      if (!ev) return 0;
+      return EVAL_FIELDS.reduce(function(n, f) { return n + tlen(ev[f.key]); }, 0);
+    }
+    function evalHasContent(ev) {
+      return !!ev && (!!ev.stars || evalTextLength(ev) > 0);
+    }
+    // 평가 4칸을 한 글로 (엑셀·목록용)
+    function evalJoined(ev) {
+      if (!ev) return '';
+      return EVAL_FIELDS.filter(function(f) { return tlen(ev[f.key]); }).map(function(f) { return '[' + f.label + '] ' + String(ev[f.key]).trim(); }).join('\n');
+    }
+
+    // 모둠원 평가 (체크한 친구 + 이유, 직접 쓴 내용) → 한 글
+    function peerText(act) {
+      if (!act) return '';
+      const out = [];
+      Object.keys(act.peerChecks || {}).forEach(function(name) {
+        out.push(name + ': ' + String(act.peerChecks[name] || '').trim());
+      });
+      if (tlen(act.peerIssue)) out.push(String(act.peerIssue).trim());
+      return out.join('\n');
+    }
+
+    // 다른 모둠 목록 (내 조 제외)
+    function otherGroups(myGroup) {
+      return GROUPS.filter(function(g) { return g !== Number(myGroup); });
+    }
+
+    // 활동 기록 상태
+    function getActStatus(sub) {
+      const act = sub && sub.reports && sub.reports.act;
+      const ind = sub && sub.grading && sub.grading.ind;
+      if (ind) {
+        if (act && act.isSubmitted && ind.reportVersion !== act.updatedAt) return { kind: 'resubmitted', label: '다시 제출 (채점 전)' };
+        return { kind: 'graded', label: act && act.isSubmitted ? '채점 완료' : '채점 완료 (미제출)' };
+      }
+      if (!act) return { kind: 'none', label: '작성 전' };
+      if (!act.isSubmitted) return { kind: 'draft', label: '작성 중' };
+      return { kind: 'submitted', label: '제출 완료' };
+    }
+
+    // 지금 점수 (모둠 점수는 모둠 정보에서, 개인 점수는 채점 기록에서). 채점 안 된 항목은 null
+    function computeScores(sub, groupInfo) {
+      const gi = sub && sub.classNo && sub.groupNo ? (groupInfo || {})[groupKey(sub.classNo, sub.groupNo)] : null;
+      const ind = (sub && sub.grading && sub.grading.ind) || {};
+      const out = {
+        plan: gi && isNum(gi.plan_score) ? gi.plan_score : null,
+        perform: gi && isNum(gi.perform_score) ? gi.perform_score : null,
+        participation: isNum(ind.participation) ? ind.participation : null,
+        review: isNum(ind.review) ? ind.review : null
+      };
+      out.total = (out.plan || 0) + (out.perform || 0) + (out.participation || 0) + (out.review || 0);
+      out.any = SCORE_ITEMS.some(function(it) { return out[it.key] !== null; });
+      out.complete = SCORE_ITEMS.every(function(it) { return out[it.key] !== null; });
+      return out;
+    }
+
+    // [점수 확정] 확정 정보 (선생님이 [확정하기]를 눌렀을 때만 있음)
+    function getConfirmed(sub) {
+      return (sub && sub.grading && sub.grading.confirmed) || null;
+    }
+
+    function snapshotDiffers(conf, scores) {
+      if (!conf) return false;
+      return SCORE_ITEMS.some(function(it) {
+        const a = conf[it.key] === undefined ? null : conf[it.key];
+        return a !== scores[it.key];
+      });
+    }
+
+    // 모둠이 받은 평가 모으기 (같은 반 다른 조 학생들이 쓴 평가)
+    function collectGroupEvals(subs, c, g) {
+      const out = [];
+      Object.keys(subs || {}).forEach(function(id) {
+        const s = subs[id];
+        if (!s || Number(s.classNo) !== Number(c) || Number(s.groupNo) === Number(g)) return;
+        const act = s.reports && s.reports.act;
+        const ev = act && act.evals && act.evals[String(g)];
+        if (!evalHasContent(ev)) return;
+        out.push({ studentId: s.studentId || id, studentName: s.studentName || '', fromGroup: s.groupNo, stars: ev.stars || 0, ev: ev, submitted: !!act.isSubmitted });
+      });
+      out.sort(function(a, b) { return String(a.studentId).localeCompare(String(b.studentId), 'ko', { numeric: true }); });
+      return out;
+    }
+
+    function evalStats(list) {
+      const done = list.filter(function(x) { return x.submitted && x.stars > 0; });
+      const avg = done.length ? done.reduce(function(a, x) { return a + x.stars; }, 0) / done.length : null;
+      return { count: done.length, draftCount: list.length - done.length, avg: avg };
+    }
+
+    function sortById(list) {
+      return list.slice().sort(function(a, b) { return String(a.studentId).localeCompare(String(b.studentId), 'ko', { numeric: true }); });
+    }
+
+    // =========================================================
+    // [엑셀] 학생 기록 전체 → 시트 4장 (요약 / 활동 기록 / 상호평가 / 모둠별 요약)
+    // =========================================================
+    function buildGradeWorkbook(subs, groupInfo) {
+      const H = function(v) { return { v: v, s: 1 }; };
+      const idCell = function(id, st) { const t = String(id); return { v: /^[1-9]\d{0,14}$/.test(t) ? Number(t) : t, s: st }; };
+      const list = sortById(Object.keys(subs || {})
+        .filter(function(id) { return subs[id]; })
+        .map(function(id) { return Object.assign({ studentId: id }, subs[id]); }));
+      const blank = function(v) { return (v === null || v === undefined) ? '' : v; };
+
+      // 1) 요약: 확정된 학생만 점수, 아니면 미확정
+      const summary = { name: '요약', widths: [10, 12, 6, 6, 14, 12, 14, 16, 12], rows: [[
+        H('학번'), H('성명'), H('반'), H('조'), H('공연 기획하기(20)'), H('공연하기(30)'), H('공연 참여 과정(10)'), H('감상평 작성하기(40)'), H('총점(100)')
+      ]] };
+      list.forEach(function(sub) {
+        const c = getConfirmed(sub);
+        const num = function(v) { return { v: blank(v), s: 4 }; };
+        const un = { v: '미확정', s: 4 };
+        summary.rows.push([
+          idCell(sub.studentId, 4), { v: sub.studentName || '', s: 2 }, num(sub.classNo), num(sub.groupNo),
+          c ? num(c.plan) : un, c ? num(c.perform) : un, c ? num(c.participation) : un, c ? num(c.review) : un, c ? num(c.total) : un
+        ]);
+      });
+
+      // 2) 활동 기록 (학생 한 명당 한 줄, 노란 칸 = 최종 제출 안 한 작성 중 내용)
+      const head = [
+        ['학번', 9], ['성명', 10], ['반', 5], ['조', 5], ['상태', 16], ['최종 제출 시각', 22], ['마지막 저장 시각', 22],
+        ['1. 맡은 역할', 16], ['1. 역할 활동 내용', 40], ['2. 공연 형태', 18], ['2. 공연 내용과 준비 과정', 50], ['2. 어려웠던 점과 해결 과정', 40], ['2. 기억에 남는 에피소드', 40], ['2. 공연 완성도', 40], ['3. 모둠원 평가 (교사만)', 30],
+        ['4. 다른 모둠 평가 수', 10],
+        ['공연 기획하기(20)', 10], ['공연하기(30)', 10], ['공연 참여 과정(10)', 10], ['감상평 작성하기(40)', 10], ['합계(100)', 10],
+        ['채점 시각', 22], ['학생에게 보여 준 코멘트', 30], ['점수 확정', 26], ['세특 메모 (교사만)', 34]
+      ];
+      const acts = { name: '활동 기록', widths: head.map(function(h) { return h[1]; }), rows: [head.map(function(h) { return H(h[0]); })] };
+      list.forEach(function(sub) {
+        const act = sub.reports && sub.reports.act;
+        const st = getActStatus(sub);
+        const draft = !!act && !act.isSubmitted;
+        const T = function(v) { return { v: blank(v), s: draft ? 3 : 2 }; };
+        const N = function(v) { return { v: blank(v), s: draft ? 5 : 4 }; };
+        const sc = computeScores(sub, groupInfo);
+        const ind = (sub.grading && sub.grading.ind) || {};
+        const conf = getConfirmed(sub);
+        const evalCount = act && act.evals ? Object.keys(act.evals).filter(function(k) { return Number(k) !== Number(sub.groupNo) && evalHasContent(act.evals[k]); }).length : 0;
+        const roleText = act ? ROLES.filter(function(r) { return act.roles && act.roles[r.key]; }).map(function(r) { return '[' + r.label + '] ' + String(((act.roleDetails || {})[r.key]) || '').trim(); }).join('\n') : '';
+        const perfText = act ? (act.perfTypes || []).map(function(t) {
+          const d = (act.perfDetails || {})[t] || {};
+          return '[' + perfTypeName(t, act) + '] 공연: ' + String(d.what || '').trim() + ' / 과정: ' + String(d.process || '').trim();
+        }).join('\n') : '';
+        acts.rows.push([
+          idCell(sub.studentId, draft ? 5 : 4), T(sub.studentName || ''), N(sub.classNo), N(sub.groupNo),
+          { v: st.kind === 'none' ? '작성 전' : st.kind === 'draft' ? '작성 중 (미제출)' : st.label, s: draft ? 6 : 2 },
+          T(act && act.isSubmitted ? act.updatedAt : ''), T(act ? act.updatedAt : ''),
+          T(roleLabels(act).join(', ')), T(roleText), T(perfTypeText(act)), T(perfText), T(act ? act.difficulty : ''), T(act ? act.episode : ''), T(act ? act.completion : ''), T(peerText(act)),
+          N(act ? evalCount : ''),
+          N(sc.plan), N(sc.perform), N(sc.participation), N(sc.review), N(sc.any ? sc.total : ''),
+          T(ind.gradedAt || ''), T(ind.comment || ''), T(conf ? '확정 (' + conf.at + ')' : '미확정'), T((sub.grading && sub.grading.teacherFeedback) || '')
+        ]);
+      });
+
+      // 3) 상호평가 (평가 한 건당 한 줄)
+      const evals = { name: '상호평가', widths: [9, 10, 5, 8, 8, 22, 7, 36, 36, 36, 36, 8, 12], rows: [[
+        H('평가한 학생 학번'), H('성명'), H('반'), H('평가자 조'), H('평가 대상 조'), H('대상 공연 제목'), H('별점(5)'),
+        H('예술성'), H('독창성'), H('개선점'), H('기타 의견'), H('글자 수'), H('상태')
+      ]] };
+      list.forEach(function(sub) {
+        const act = sub.reports && sub.reports.act;
+        if (!act || !act.evals) return;
+        const draft = !act.isSubmitted;
+        Object.keys(act.evals).sort().forEach(function(k) {
+          const x = act.evals[k];
+          if (!evalHasContent(x)) return;
+          if (Number(k) === Number(sub.groupNo)) return;
+          const gi = (groupInfo || {})[groupKey(sub.classNo, k)] || {};
+          evals.rows.push([
+            idCell(sub.studentId, draft ? 5 : 4), { v: sub.studentName || '', s: draft ? 3 : 2 },
+            { v: blank(sub.classNo), s: draft ? 5 : 4 }, { v: blank(sub.groupNo), s: draft ? 5 : 4 }, { v: Number(k), s: draft ? 5 : 4 },
+            { v: gi.title || '', s: draft ? 3 : 2 }, { v: x.stars || '', s: draft ? 5 : 4 }]
+            .concat(EVAL_FIELDS.map(function(f) { return { v: x[f.key] || '', s: draft ? 3 : 2 }; }))
+            .concat([{ v: evalTextLength(x), s: draft ? 5 : 4 },
+            { v: draft ? '작성 중 (미제출)' : '제출', s: draft ? 6 : 2 }
+          ]));
+        });
+      });
+
+      // 4) 모둠별 요약 (평균 별점은 최종 제출한 평가만)
+      const groups = { name: '모둠별 요약', widths: [5, 5, 24, 30, 26, 30, 10, 10, 12, 10], rows: [[
+        H('반'), H('조'), H('공연 제목'), H('영상 링크'), H('조원 (선생님 입력)'), H('사이트에 등록한 조원'), H('받은 평가 수'), H('평균 별점'), H('공연 기획하기(20)'), H('공연하기(30)')
+      ]] };
+      CLASSES.forEach(function(c) {
+        GROUPS.forEach(function(g) {
+          const gi = (groupInfo || {})[groupKey(c, g)] || {};
+          const members = list.filter(function(s) { return Number(s.classNo) === c && Number(s.groupNo) === g; });
+          const stats = evalStats(collectGroupEvals(subs, c, g));
+          if (!members.length && !gi.title && !gi.video_url && !gi.members && !stats.count) return;
+          groups.rows.push([
+            { v: c, s: 4 }, { v: g, s: 4 }, { v: gi.title || '', s: 2 }, { v: gi.video_url || '', s: 2 }, { v: gi.members || '', s: 2 },
+            { v: members.map(function(s) { return s.studentName + '(' + s.studentId + ')'; }).join(', '), s: 2 },
+            { v: stats.count, s: 4 }, { v: stats.avg === null ? '' : Math.round(stats.avg * 100) / 100, s: 4 },
+            { v: blank(gi.plan_score), s: 4 }, { v: blank(gi.perform_score), s: 4 }
+          ]);
+        });
+      });
+
+      return [summary, acts, evals, groups];
+    }
+
+    // =========================================================
+    // 화면 조각들
+    // =========================================================
+    const STATUS_STYLE = {
+      none: 'bg-slate-100 text-slate-400',
+      draft: 'bg-slate-100 text-slate-600',
+      submitted: 'bg-blue-100 text-blue-700',
+      resubmitted: 'bg-amber-100 text-amber-800',
+      graded: 'bg-emerald-100 text-emerald-800'
+    };
+    const STATUS_ICON = {
+      none: 'fa-minus',
+      draft: 'fa-pen',
+      submitted: 'fa-paper-plane',
+      resubmitted: 'fa-rotate',
+      graded: 'fa-circle-check'
+    };
+
+    function StatusBadge(props) {
+      const st = props.status;
+      const cls = 'inline-flex items-center gap-1 text-2xs font-extrabold px-2 py-0.5 rounded-full whitespace-nowrap ' + STATUS_STYLE[st.kind];
+      return e('span', { className: cls },
+        e('i', { className: 'fa-solid ' + STATUS_ICON[st.kind] }),
+        e('span', null, st.label)
+      );
+    }
+
+    // 별점 (readOnly면 보기만)
+    function Stars(props) {
+      const v = props.value || 0;
+      const size = props.size || 'text-xl';
+      return e('div', { className: 'inline-flex items-center gap-0.5' },
+        [1, 2, 3, 4, 5].map(function(n) {
+          const on = n <= v;
+          const icon = e('i', { className: (on ? 'fa-solid text-amber-400' : 'fa-regular text-slate-300') + ' fa-star ' + size });
+          if (props.readOnly) return e('span', { key: n }, icon);
+          return e('button', {
+            key: n, type: 'button', 'aria-label': n + '점',
+            onClick: function() { props.onChange(n === v ? 0 : n); },
+            className: 'p-0.5 hover:scale-110 transition'
+          }, icon);
+        }),
+        !props.readOnly && e('span', { className: 'ml-1.5 text-xs font-bold ' + (v ? 'text-amber-600' : 'text-slate-400') }, v ? v + ' / 5' : '별점을 눌러 주세요')
+      );
+    }
+
+    // 영상 보기: 유튜브면 버튼을 누를 때만 화면 안에서 재생 (서버 사용량 없음, 학생 데이터도 아끼도록)
+    function VideoBox(props) {
+      const [open, setOpen] = useState(false);
+      const url = props.url;
+      if (!url) return e('p', { className: 'text-2xs text-slate-400' }, '아직 영상 링크가 없어요.');
+      const yid = youtubeId(url);
+      return e('div', { className: 'space-y-2' },
+        e('div', { className: 'flex flex-wrap gap-1.5' },
+          yid && e('button', { type: 'button', onClick: function() { setOpen(!open); }, className: 'px-2.5 py-1 rounded-lg bg-rose-600 hover:bg-rose-700 text-white text-2xs font-bold inline-flex items-center gap-1' },
+            e('i', { className: 'fa-brands fa-youtube' }), e('span', null, open ? '영상 닫기' : '여기서 영상 보기')),
+          e('a', { href: url, target: '_blank', rel: 'noopener noreferrer', className: 'px-2.5 py-1 rounded-lg border border-slate-300 text-slate-700 hover:bg-slate-50 text-2xs font-bold inline-flex items-center gap-1' },
+            e('i', { className: 'fa-solid fa-arrow-up-right-from-square' }), e('span', null, '새 창에서 열기'))
+        ),
+        open && yid && e('div', { className: 'relative w-full rounded-xl overflow-hidden bg-black', style: { paddingTop: '56.25%' } },
+          e('iframe', {
+            src: 'https://www.youtube-nocookie.com/embed/' + yid,
+            title: '공연 영상', allow: 'accelerometer; encrypted-media; gyroscope; picture-in-picture; fullscreen', allowFullScreen: true,
+            className: 'absolute inset-0 w-full h-full', style: { border: 0 }
+          })
+        )
+      );
+    }
+
+    // 점수표 (학생·교사 공용). scores: { plan, perform, participation, review, total }
+    function ScoreTable(props) {
+      const sc = props.scores;
+      const cell = function(v, max) {
+        return v === null || v === undefined
+          ? e('span', { className: 'text-slate-400 font-bold text-xs' }, '채점 전')
+          : e('span', { className: 'font-black text-slate-900' }, v, e('span', { className: 'text-2xs font-bold text-slate-400 ml-0.5' }, '/ ' + max));
+      };
+      const area = function(name, items, color) {
+        return e('div', { className: 'rounded-xl border ' + color + ' overflow-hidden' },
+          e('p', { className: 'px-3 py-1.5 text-2xs font-black border-b ' + color }, name),
+          e('div', { className: 'divide-y divide-slate-100 bg-white' },
+            items.map(function(it) {
+              return e('div', { key: it.key, className: 'px-3 py-2 flex items-center justify-between text-xs' },
+                e('span', { className: 'font-bold text-slate-700' }, it.label),
+                cell(sc[it.key], it.max)
+              );
+            })
+          )
+        );
+      };
+      return e('div', { className: 'space-y-2' },
+        e('div', { className: 'grid grid-cols-1 sm:grid-cols-2 gap-2' },
+          area('모둠 평가 (조원 모두 같은 점수)', SCORE_ITEMS.slice(0, 2), 'border-violet-200 bg-violet-50 text-violet-900'),
+          area('개인 평가', SCORE_ITEMS.slice(2), 'border-sky-200 bg-sky-50 text-sky-900')
+        ),
+        e('div', { className: 'flex items-center justify-between px-3 py-2.5 rounded-xl bg-slate-900 text-white' },
+          e('span', { className: 'text-xs font-bold' }, props.final ? '최종 총점' : '총점 (지금까지 채점된 점수)'),
+          e('span', { className: 'text-xl font-black' }, sc.total, e('span', { className: 'text-xs font-bold text-slate-300 ml-1' }, '/ ' + TOTAL_MAX + '점'))
+        )
+      );
+    }
+
+    // 학생 활동 기록 읽기 전용 보기 (교사 채점 창, 학생 마감 후 화면에서 사용)
+    function ActView(props) {
+      const act = props.act;
+      const gi = props.groupInfo || {};
+      if (!act) return e('div', { className: 'p-4 rounded-xl bg-slate-100 text-slate-500 text-xs' }, '아직 작성한 내용이 없습니다.');
+      const box = function(title, body, note) {
+        return e('div', { className: 'rounded-xl border border-slate-200 bg-white' },
+          e('div', { className: 'px-3 py-2 border-b border-slate-100 flex items-center justify-between gap-2' },
+            e('p', { className: 'text-xs font-black text-slate-800' }, title),
+            note && e('span', { className: 'text-2xs font-bold text-rose-600 whitespace-nowrap' }, note)
+          ),
+          e('div', { className: 'p-3 text-xs leading-relaxed text-slate-700 space-y-2' }, body)
+        );
+      };
+      const text = function(v) {
+        return v && String(v).trim()
+          ? e('p', { className: 'whitespace-pre-wrap' }, v)
+          : e('p', { className: 'text-slate-400' }, '(작성하지 않음)');
+      };
+      const labeled = function(key, label, v) {
+        return e('div', { key: key }, e('p', { className: 'font-bold mb-0.5 text-slate-800' }, label), text(v));
+      };
+      const roleKeys = ROLES.filter(function(r) { return act.roles && act.roles[r.key]; });
+      const types = act.perfTypes || [];
+      const peerNames = Object.keys(act.peerChecks || {});
+      return e('div', { className: 'space-y-3' },
+        box('1. 모둠 내 특별 활동 (해당자만)',
+          roleKeys.length
+            ? roleKeys.map(function(r) { return labeled(r.key, '[' + r.label + ']', (act.roleDetails || {})[r.key]); })
+            : e('p', { className: 'text-slate-400' }, '특별 역할 없음')
+        ),
+        box('2. 개인 활동 내용',
+          [e('p', { key: 'p' }, e('span', { className: 'font-bold' }, '공연 형태: '), perfTypeText(act) || '(선택하지 않음)')]
+            .concat(types.map(function(t) {
+              const d = (act.perfDetails || {})[t] || {};
+              return e('div', { key: 't-' + t, className: 'p-2.5 rounded-lg bg-violet-50 border border-violet-100 space-y-1.5' },
+                e('p', { className: 'font-black text-violet-800' }, perfTypeName(t, act)),
+                labeled('w', '어떤 공연을 했는지', d.what),
+                labeled('pr', '준비 과정', d.process)
+              );
+            }))
+            .concat(REFLECT_FIELDS.map(function(f) { return labeled(f.key, f.label, act[f.key]); }))
+        ),
+        box('3. 모둠원 평가 (불참·불성실 모둠원)',
+          peerNames.length || tlen(act.peerIssue)
+            ? peerNames.map(function(n) { return labeled('pc-' + n, n, act.peerChecks[n]); })
+                .concat(tlen(act.peerIssue) ? [labeled('pi', '직접 쓴 내용', act.peerIssue)] : [])
+            : e('p', { className: 'text-slate-400' }, '해당 모둠원 없음'),
+          props.forTeacher ? '선생님만 보는 내용' : '선생님만 봐요'),
+        box('4. 다른 모둠 공연 평가',
+          otherGroups(props.groupNo).map(function(g) {
+            const ev = (act.evals || {})[String(g)] || {};
+            const info = gi[groupKey(props.classNo, g)] || {};
+            return e('div', { key: g, className: 'p-2.5 rounded-lg bg-slate-50 border border-slate-100 space-y-1.5' },
+              e('div', { className: 'flex items-center justify-between gap-2 flex-wrap' },
+                e('p', { className: 'font-bold text-slate-800' }, g + '조' + (info.title ? ' · ' + info.title : '')),
+                e(Stars, { value: ev.stars || 0, readOnly: true, size: 'text-sm' })
+              ),
+              EVAL_FIELDS.map(function(f) { return labeled(f.key, f.label, ev[f.key]); })
+            );
+          }),
+          props.forTeacher ? '선생님만 보는 내용' : '선생님만 봐요'
+        )
+      );
+    }
+
+    function App() {
+      const [mainTab, setMainTab] = useState('activity');
+      const [currentUser, setCurrentUser] = useState(function() {
+        try {
+          const savedUser = sessionStorage.getItem('perf_current_user');
+          return savedUser ? JSON.parse(savedUser) : null;
+        } catch(err) { return null; }
+      });
+
+      const [studentIdInput, setStudentIdInput] = useState('');
+      const [studentPwInput, setStudentPwInput] = useState('');
+      const [studentNameInput, setStudentNameInput] = useState('');
+      const [registerClass, setRegisterClass] = useState('');
+      const [registerGroup, setRegisterGroup] = useState('');
+      // 등록 화면: 고른 반의 공연 제목·조원 이름만 (영상 링크는 받지 않음)
+      const [regGroups, setRegGroups] = useState([]);
+      const [isRegisterMode, setIsRegisterMode] = useState(false);
+      const [authBusy, setAuthBusy] = useState(false);
+
+      const [showTeacherModal, setShowTeacherModal] = useState(false);
+      const [teacherIdInput, setTeacherIdInput] = useState('');
+      const [teacherPwInput, setTeacherPwInput] = useState('');
+      const [teacherAuth, setTeacherAuth] = useState(function() {
+        try {
+          const s = localStorage.getItem('perf_teacher_auth');
+          return s ? JSON.parse(s) : { id: 'klidaum', pw: '123456' };
+        } catch(err) { return { id: 'klidaum', pw: '123456' }; }
+      });
+
+      const [teacherSubTab, setTeacherSubTab] = useState('submissions');
+      const [classFilter, setClassFilter] = useState('all');
+      const [groupClass, setGroupClass] = useState(5);
+
+      // [제출 마감] 서버에서 받은 마감 정보 (offset = 서버 시각 - 이 기기 시각)
+      const [portal, setPortal] = useState(function() {
+        try {
+          const c = localStorage.getItem('perf_portal_status');
+          if (c) { const o = JSON.parse(c); return { manual: !!o.manual, deadline: o.deadline || null, offset: o.offset || 0, serverClosed: false, known: true }; }
+        } catch (err) {}
+        return { manual: false, deadline: null, offset: 0, serverClosed: false, known: false };
+      });
+      const portalRef = useRef(portal);
+      portalRef.current = portal;
+      const [, setClockTick] = useState(0);
+      const [showDeadlineModal, setShowDeadlineModal] = useState(false);
+      const [deadlineInput, setDeadlineInput] = useState('');
+      const [deadlinePw, setDeadlinePw] = useState('');
+      const [deadlineBusy, setDeadlineBusy] = useState(false);
+      const [showFinalPopup, setShowFinalPopup] = useState(false);
+      const [studentCloudLoaded, setStudentCloudLoaded] = useState(0);
+      const confirmLockHitRef = useRef(false);
+      const [isCloudSyncing, setIsCloudSyncing] = useState(false);
+
+      // 서버 상태: 'checking'(확인 중) / 'online'(정상) / 'offline'(응답 없음)
+      const [serverStatus, setServerStatus] = useState(OFFLINE_MODE || !supabaseClient ? 'offline' : 'checking');
+      const offlineRef = useRef(OFFLINE_MODE || !supabaseClient);
+      const isOffline = OFFLINE_MODE || serverStatus === 'offline';
+      const cloudReady = function() { return !!supabaseClient && !offlineRef.current; };
+      const markOffline = function() {
+        if (!offlineRef.current) {
+          offlineRef.current = true;
+          setServerStatus('offline');
+        }
+      };
+      const markOnline = function() {
+        offlineRef.current = false;
+        setServerStatus('online');
+      };
+      const isPortalClosedNow = function(pOpt) {
+        const pp = pOpt || portalRef.current;
+        if (pp.manual || pp.serverClosed) return true;
+        if (!pp.deadline) return false;
+        return Date.now() + (pp.offset || 0) >= new Date(pp.deadline).getTime();
+      };
+      const applyPortal = function(np) {
+        portalRef.current = np;
+        setPortal(np);
+        safeSetLocal('perf_portal_status', JSON.stringify({ manual: np.manual, deadline: np.deadline, offset: np.offset }));
+      };
+      const refreshPortalStatus = async function() {
+        if (!cloudReady()) return null;
+        try {
+          const res = await withTimeout(supabaseClient.rpc('portal_status'), SERVER_CHECK_MS);
+          if (res.error) {
+            if (isNetworkFailure(res)) markOffline();
+            return null;
+          }
+          const d = res.data || {};
+          const np = {
+            manual: !!d.manual,
+            deadline: d.deadline || null,
+            offset: d.now ? new Date(d.now).getTime() - Date.now() : 0,
+            serverClosed: !!d.closed,
+            known: true
+          };
+          applyPortal(np);
+          return np;
+        } catch (err) {
+          if (isNetworkFailure(err)) markOffline();
+          return null;
+        }
+      };
+      const markPortalClosed = function() {
+        applyPortal(Object.assign({}, portalRef.current, { serverClosed: true, known: true }));
+      };
+      const DEADLINE_MSG = '제출이 마감되어 더 이상 작성·수정·제출할 수 없습니다.';
+      const CONFIRMED_MSG = '선생님이 점수를 확정해서 더 이상 활동 기록을 고칠 수 없습니다.';
+      const lockMessage = function(reason) { return reason === 'confirmed' ? CONFIRMED_MSG : DEADLINE_MSG; };
+      const lockReasonAfterFailedSync = function() {
+        if (confirmLockHitRef.current) return 'confirmed';
+        if (portalRef.current.serverClosed) return 'deadline';
+        return null;
+      };
+
+      const SERVER_DOWN_MSG = '서버 응답이 없어 지금은 할 수 없습니다. 서버가 돌아오면(상단 표시가 정상으로 바뀌면) 다시 시도해 주세요.';
+
+      const [allSubmissions, setAllSubmissions] = useState(function() {
+        try {
+          const s = localStorage.getItem('perf_submissions');
+          return s ? JSON.parse(s) : {};
+        } catch(err) { return {}; }
+      });
+      // 모둠 정보: 키 '반-조' → { title, video_url, members, plan_score, perform_score }
+      const [groupInfo, setGroupInfo] = useState(function() {
+        try {
+          const s = localStorage.getItem('perf_group_info');
+          return s ? JSON.parse(s) : {};
+        } catch(err) { return {}; }
+      });
+      const groupInfoRef = useRef(groupInfo);
+      groupInfoRef.current = groupInfo;
+      const mergeGroupRows = function(rows) {
+        if (!rows || !rows.length) return;
+        // 바로 다음 줄의 계산에서도 최신 값을 쓰도록 ref를 먼저 바꾸고 화면 상태를 갱신
+        const up = Object.assign({}, groupInfoRef.current);
+        rows.forEach(function(r) {
+          if (!r || r.class_no === undefined || r.group_no === undefined) return;
+          const k = groupKey(r.class_no, r.group_no);
+          const cur = Object.assign({}, up[k] || {});
+          ['title', 'video_url', 'members', 'plan_score', 'perform_score'].forEach(function(f) {
+            if (r[f] !== undefined) cur[f] = r[f];
+          });
+          up[k] = cur;
+        });
+        groupInfoRef.current = up;
+        safeSetLocal('perf_group_info', JSON.stringify(up));
+        setGroupInfo(up);
+      };
+
+      // 교사 채점 창
+      const [gradingStudentId, setGradingStudentId] = useState(null);
+      const [gradingForm, setGradingForm] = useState({ plan: '', perform: '', participation: '', review: '', comment: '', teacherFeedback: '' });
+      const [gradingBusy, setGradingBusy] = useState(false);
+      // 모둠 관리: 받은 평가 보기 창 { c, g }
+      const [groupEvalViewer, setGroupEvalViewer] = useState(null);
+      // 모둠 관리 입력값 (키 '반-조' → { title, video_url, members, plan, perform })
+      const [groupDrafts, setGroupDrafts] = useState({});
+      const [groupBusy, setGroupBusy] = useState('');
+
+      const [newTeacherId, setNewTeacherId] = useState('');
+      const [newTeacherPw, setNewTeacherPw] = useState('');
+      const [currentTeacherPw, setCurrentTeacherPw] = useState('');
+      const [toastMessage, setToastMessage] = useState('');
+
+      const [editingStudentModal, setEditingStudentModal] = useState(false);
+      const [editingStudentTargetId, setEditingStudentTargetId] = useState(null);
+      const [editingStudentForm, setEditingStudentForm] = useState({ id: '', name: '', classNo: '', groupNo: '' });
+
+      // 학생 작성 양식
+      const [actForm, setActForm] = useState(function() { return Object.assign({ classNo: '', groupNo: '' }, emptyAct()); });
+      const formDirtyRef = useRef(false);
+      const [saveBusy, setSaveBusy] = useState(false);
+
+      const toastTimerRef = useRef(null);
+      const showToast = function(msg, ms) {
+        setToastMessage(msg);
+        if (toastTimerRef.current) clearTimeout(toastTimerRef.current);
+        toastTimerRef.current = setTimeout(function() { setToastMessage(''); }, ms || 2600);
+      };
+
+      const currentUserRef = useRef(currentUser);
+      currentUserRef.current = currentUser;
+
+      const putLocalSub = function(id, data) {
+        setAllSubmissions(function(prev) {
+          const up = Object.assign({}, prev, { [id]: data });
+          safeSetLocal('perf_submissions', JSON.stringify(up));
+          return up;
+        });
+      };
+
+      // =========================================================
+      // [클라우드 연동]
+      // =========================================================
+
+      // 모둠 정보 불러오기
+      //   교사: 모든 반, 점수까지 전부
+      //   학생: 자기 반만 (공연 제목·영상·조원). 반이 아직 없으면 반을 고를 수 있게 제목·조원만 (영상 링크 없음)
+      //   학생 기기에는 받아 온 것만 남기고 다른 반 정보는 지움
+      const fetchGroupInfo = async function(u, classNo) {
+        if (!cloudReady() || !u) return;
+        try {
+          if (u.role === 'teacher') {
+            const res = await withTimeout(supabaseClient.from('group_info').select('class_no, group_no, title, video_url, members, plan_score, perform_score'));
+            if (!res.error && res.data) mergeGroupRows(res.data);
+            else if (isNetworkFailure(res)) markOffline();
+            return;
+          }
+          const c = Number(classNo) || null;
+          let query = supabaseClient.from('group_info').select(c ? 'class_no, group_no, title, video_url, members' : 'class_no, group_no, title, members');
+          if (c) query = query.eq('class_no', c);
+          const res = await withTimeout(query);
+          if (!res.error && res.data) {
+            const fresh = {};
+            res.data.forEach(function(r) {
+              if (c && Number(r.class_no) !== c) return;
+              fresh[groupKey(r.class_no, r.group_no)] = { title: r.title || '', video_url: c ? (r.video_url || '') : '', members: r.members || '' };
+            });
+            groupInfoRef.current = fresh;
+            safeSetLocal('perf_group_info', JSON.stringify(fresh));
+            setGroupInfo(fresh);
+          } else if (isNetworkFailure(res)) markOffline();
+        } catch (err) {
+          if (isNetworkFailure(err)) markOffline();
+        }
+      };
+
+      // 학생: 자기 조의 모둠 점수만 확인
+      const fetchMyGroupScores = async function(c, g) {
+        if (!cloudReady() || !c || !g) return;
+        try {
+          const res = await withTimeout(supabaseClient.from('group_info').select('class_no, group_no, plan_score, perform_score').eq('class_no', Number(c)).eq('group_no', Number(g)).maybeSingle(), SERVER_CHECK_MS);
+          if (!res.error) {
+            mergeGroupRows([res.data || { class_no: Number(c), group_no: Number(g), plan_score: null, perform_score: null }]);
+          } else if (isNetworkFailure(res)) markOffline();
+        } catch (err) {
+          if (isNetworkFailure(err)) markOffline();
+        }
+      };
+
+      // 활동 기록 불러오기 (학생: 자기 것만 / 교사: 전체)
+      const fetchSubmissionsFromCloud = async function(userOverride) {
+        if (!cloudReady()) return;
+        const u = (userOverride && userOverride.role) ? userOverride : currentUserRef.current;
+        if (!u) return;
+        try {
+          if (u.role === 'teacher') { setIsCloudSyncing(true); fetchGroupInfo(u); }
+          let query = supabaseClient.from('submissions').select('student_id, data');
+          if (u.role === 'student') query = query.eq('student_id', String(u.id));
+          const res = await withTimeout(query);
+          if (!res.error && res.data) {
+            const pending = getPendingSync();
+            setAllSubmissions(function(prev) {
+              const merged = u.role === 'teacher' ? {} : Object.assign({}, prev);
+              if (u.role === 'teacher') {
+                // 교사: 서버에 없는 학생(다른 곳에서 삭제됨)은 화면에서도 지움
+                Object.keys(prev).forEach(function(id) { if (pending.indexOf(String(id)) !== -1) merged[id] = prev[id]; });
+              }
+              res.data.forEach(function(row) {
+                if (row.student_id && row.data && pending.indexOf(String(row.student_id)) === -1) merged[row.student_id] = row.data;
+              });
+              safeSetLocal('perf_submissions', JSON.stringify(merged));
+              return merged;
+            });
+            if (u.role === 'student') {
+              const mine = res.data[0] && res.data[0].data;
+              await fetchGroupInfo(u, mine && mine.classNo);
+              if (mine && mine.classNo && mine.groupNo) await fetchMyGroupScores(mine.classNo, mine.groupNo);
+              setStudentCloudLoaded(function(n) { return n + 1; });
+            }
+          } else if (isNetworkFailure(res)) {
+            markOffline();
+          }
+        } catch (err) {
+          console.error('Cloud Fetch Error:', err);
+          if (isNetworkFailure(err)) markOffline();
+        } finally {
+          if (u.role === 'teacher') setIsCloudSyncing(false);
+        }
+      };
+
+      const fetchOneFromCloud = async function(id) {
+        if (!cloudReady() || !id) return;
+        try {
+          const res = await withTimeout(supabaseClient.from('submissions').select('student_id, data').eq('student_id', String(id)).maybeSingle());
+          if (!res.error && res.data && res.data.data) putLocalSub(id, res.data.data);
+        } catch (err) {
+          console.error('Cloud Fetch One Error:', err);
+        }
+      };
+
+      // 학생 한 명 기록 올리기 (성공하면 true). gradingOnly: 채점 저장용 표시(내용은 받은 그대로)
+      const syncStudentToCloud = async function(studentId, submissionData) {
+        if (!cloudReady() || !studentId) return false;
+        confirmLockHitRef.current = false;
+        try {
+          const res = await withTimeout(supabaseClient
+            .from('submissions')
+            .upsert({
+              student_id: String(studentId),
+              data: submissionData,
+              updated_at: new Date().toISOString()
+            }, { onConflict: 'student_id' }));
+          if (res.error) {
+            console.error('Cloud Sync Error:', res.error);
+            if (isNetworkFailure(res)) markOffline();
+            if (isDeadlineError(res)) markPortalClosed();
+            if (isConfirmedLockError(res)) confirmLockHitRef.current = true;
+            return false;
+          }
+          return true;
+        } catch (err) {
+          console.error('Cloud Sync Error:', err);
+          if (isNetworkFailure(err)) markOffline();
+          return false;
+        }
+      };
+
+      // 학생 기기: 1분마다 내 채점 결과 + 우리 조 모둠 점수만 확인 (작은 요청)
+      const checkMyGrading = async function(u) {
+        if (!cloudReady() || !u || u.role !== 'student') return;
+        try {
+          const res = await withTimeout(supabaseClient.from('submissions').select('grading:data->grading, classNo:data->classNo, groupNo:data->groupNo').eq('student_id', String(u.id)).maybeSingle(), SERVER_CHECK_MS);
+          if (res.error || !res.data) {
+            if (isNetworkFailure(res)) markOffline();
+            return undefined;
+          }
+          const g = res.data.grading || null;
+          const sc = res.data.classNo || null, sg = res.data.groupNo || null;
+          const before = loadLocalSubmissions()[u.id] || {};
+          const placeChanged = (sc || sg) && (Number(before.classNo || 0) !== Number(sc || 0) || Number(before.groupNo || 0) !== Number(sg || 0));
+          setAllSubmissions(function(prev) {
+            const mine = prev[u.id];
+            if (!mine) return prev;
+            const sameGrade = JSON.stringify(mine.grading || null) === JSON.stringify(g);
+            const samePlace = !(sc || sg) || (Number(mine.classNo || 0) === Number(sc || 0) && Number(mine.groupNo || 0) === Number(sg || 0));
+            if (sameGrade && samePlace) return prev;
+            const patch = { grading: g || undefined };
+            // 선생님이 반·조를 바꾸면 학생 화면에도 반영
+            if (!samePlace) { patch.classNo = sc || undefined; patch.groupNo = sg || undefined; }
+            const up = Object.assign({}, prev, { [u.id]: Object.assign({}, mine, patch) });
+            safeSetLocal('perf_submissions', JSON.stringify(up));
+            return up;
+          });
+          if (placeChanged && sc) await fetchGroupInfo(u, sc);
+          if (res.data.classNo && res.data.groupNo) await fetchMyGroupScores(res.data.classNo, res.data.groupNo);
+          return g;
+        } catch (err) {
+          if (isNetworkFailure(err)) markOffline();
+          return undefined;
+        }
+      };
+
+      // 이 기기에 쌓여 있던(아직 전달하지 못한) 기록을 클라우드로 올리기 (채점 결과는 서버 것 유지)
+      const pushPendingForStudent = async function(id) {
+        if (!cloudReady() || getPendingSync().indexOf(String(id)) === -1) return;
+        const local = loadLocalSubmissions()[id];
+        if (!local) { removePendingSync(id); return; }
+        try {
+          const res = await withTimeout(supabaseClient.from('submissions').select('data').eq('student_id', String(id)).maybeSingle());
+          if (res.error) return;
+          const cloud = (res.data && res.data.data) || {};
+          const merged = Object.assign({}, cloud, local, {
+            reports: Object.assign({}, cloud.reports || {}, local.reports || {})
+          });
+          if (cloud.grading) merged.grading = cloud.grading; else delete merged.grading;
+          const ok = await syncStudentToCloud(id, merged);
+          if (ok) {
+            removePendingSync(id);
+            putLocalSub(id, merged);
+            showToast('이 기기에 저장해 둔 활동 기록을 선생님께 전달했습니다. ☁️', 5000);
+          } else if (lockReasonAfterFailedSync()) {
+            const why = lockReasonAfterFailedSync();
+            removePendingSync(id);
+            formDirtyRef.current = false;
+            fetchSubmissionsFromCloud({ role: 'student', id: id });
+            showToast((why === 'confirmed' ? '점수가 확정된 뒤라' : '제출 마감 이후라') + ' 이 기기에만 저장되어 있던 내용은 전달되지 않았습니다.', 7000);
+          }
+        } catch (err) {
+          console.error('Pending Push Error:', err);
+        }
+      };
+
+      // 서버가 살아 있는지 짧게 확인 (8초 안에 답이 없으면 오프라인으로 전환)
+      const serverStatusShownRef = useRef(serverStatus);
+      serverStatusShownRef.current = serverStatus;
+      const checkServer = async function() {
+        if (OFFLINE_MODE || !supabaseClient) return false;
+        try {
+          const res = await withTimeout(supabaseClient.from('students').select('student_id').limit(1), SERVER_CHECK_MS);
+          if (isNetworkFailure(res)) { markOffline(); return false; }
+          const wasOffline = offlineRef.current;
+          markOnline();
+          if (wasOffline && serverStatusShownRef.current === 'offline') {
+            showToast('서버가 다시 연결되었습니다. ☁️');
+          }
+          return true;
+        } catch (err) {
+          markOffline();
+          return false;
+        }
+      };
+
+      // 1분마다 작은 확인: 서버 상태 + 마감 정보 + (학생) 계정·채점 결과. 전체 기록은 처음·재연결 때만
+      const firstTickDoneRef = useRef(false);
+      useEffect(function() {
+        if (OFFLINE_MODE || !supabaseClient) return;
+        const tick = async function() {
+          const wasOffline = offlineRef.current;
+          const ok = await checkServer();
+          if (!ok) return;
+          await refreshPortalStatus();
+          const u = currentUserRef.current;
+          const needFullFetch = !firstTickDoneRef.current || wasOffline;
+          firstTickDoneRef.current = true;
+          if (!u) return;
+          verifyStudentStillExists(u);
+          if (needFullFetch) fetchSubmissionsFromCloud(u);
+          else checkMyGrading(u);
+        };
+        tick();
+        const interval = setInterval(tick, 60000);
+        return function() { clearInterval(interval); };
+      }, []);
+
+      // 마감 시각이 지나는 순간 화면이 바로 바뀌도록 10초마다 다시 그림 (서버 요청 없음)
+      useEffect(function() {
+        const t = setInterval(function() { setClockTick(function(n) { return n + 1; }); }, 10000);
+        return function() { clearInterval(t); };
+      }, []);
+
+      // [실시간] 교사: 학생 기록이 바뀌면 그 학생 것만 반영 / 학생: 계정 삭제만 감시
+      const liveKey = currentUser ? currentUser.role + ':' + currentUser.id : '';
+      useEffect(function() {
+        if (!supabaseClient || !currentUser || serverStatus !== 'online') return;
+        const isStudent = currentUser.role === 'student';
+        let channel = null;
+        try {
+          channel = supabaseClient.channel('live-' + liveKey);
+          if (!isStudent) channel = channel
+            .on('postgres_changes', { event: '*', schema: 'public', table: 'submissions' }, function(payload) {
+              if (payload.eventType === 'DELETE') {
+                const delId = payload.old && payload.old.student_id;
+                if (delId) {
+                  setAllSubmissions(function(prev) {
+                    if (!prev[delId]) return prev;
+                    const up = Object.assign({}, prev);
+                    delete up[delId];
+                    safeSetLocal('perf_submissions', JSON.stringify(up));
+                    return up;
+                  });
+                }
+                return;
+              }
+              const row = payload.new || {};
+              if (!row.student_id) return;
+              if (row.data) putLocalSub(row.student_id, row.data);
+              else fetchOneFromCloud(row.student_id);
+            });
+          if (isStudent) {
+            channel = channel.on('postgres_changes', { event: 'DELETE', schema: 'public', table: 'students' }, function() {
+              verifyStudentStillExists(currentUserRef.current);
+            });
+          }
+          channel.subscribe();
+        } catch (err) {
+          console.error('Realtime Subscribe Error:', err);
+        }
+        return function() {
+          if (channel) supabaseClient.removeChannel(channel);
+        };
+      }, [liveKey, serverStatus]);
+
+      // 학생 화면: 채점 결과가 새로 들어오면 알림
+      const lastGradedRef = useRef(null);
+      useEffect(function() {
+        if (!currentUser || currentUser.role !== 'student') { lastGradedRef.current = null; return; }
+        const mine = allSubmissions[currentUser.id];
+        const stamp = (mine && mine.grading && mine.grading.gradedAt) || '';
+        if (lastGradedRef.current !== null && stamp && stamp !== lastGradedRef.current) {
+          showToast('선생님이 채점했습니다. 화면 위쪽 점수표에서 확인하세요. 📝', 5000);
+        }
+        lastGradedRef.current = stamp;
+      }, [allSubmissions, currentUser]);
+
+      const updateCurrentUserSession = function(user) {
+        setCurrentUser(user);
+        currentUserRef.current = user;
+        try {
+          if (user) sessionStorage.setItem('perf_current_user', JSON.stringify(user));
+          else sessionStorage.removeItem('perf_current_user');
+        } catch (err) {}
+      };
+
+      // =========================================================
+      // [학생 계정] Supabase 'students' 표
+      // =========================================================
+      const getStudentAccounts = function() {
+        try {
+          const s = localStorage.getItem('perf_student_accounts');
+          return s ? JSON.parse(s) : {};
+        } catch(err) { return {}; }
+      };
+
+      const cacheLocalAccount = function(id, name, pw) {
+        const accs = getStudentAccounts();
+        accs[id] = { id: id, name: name, pw: pw };
+        safeSetLocal('perf_student_accounts', JSON.stringify(accs));
+      };
+
+      const ACCOUNT_STORE_ERROR = '학생 계정 저장소(students 표)에 연결할 수 없습니다. 잠시 후 다시 시도하고, 계속되면 선생님께 알려 주세요.';
+
+      const cloudGetAccount = function(id) {
+        return withTimeout(supabaseClient.from('students').select('*').eq('student_id', String(id)).maybeSingle(), SERVER_CHECK_MS);
+      };
+
+      const showAccountError = function(err) {
+        if (err && err.message === 'TIMEOUT') {
+          showToast('클라우드 응답이 없습니다. 서버 점검 중일 수 있으니 잠시 후 다시 시도해 주세요.', 6000);
+          return;
+        }
+        const detail = err && (err.message || err.code) ? ' (' + (err.code ? err.code + ': ' : '') + (err.message || '') + ')' : '';
+        showToast(ACCOUNT_STORE_ERROR + detail, 7000);
+      };
+
+      const purgeLocalStudent = function(id) {
+        removePendingSync(id);
+        const accs = getStudentAccounts();
+        if (accs[id]) {
+          delete accs[id];
+          safeSetLocal('perf_student_accounts', JSON.stringify(accs));
+        }
+        setAllSubmissions(function(prev) {
+          if (!prev[id]) return prev;
+          const up = Object.assign({}, prev);
+          delete up[id];
+          safeSetLocal('perf_submissions', JSON.stringify(up));
+          return up;
+        });
+      };
+
+      // 오프라인 때 이 기기에서 만든 계정을 서버로 옮기기 (이 기기에 쓴 기록이 아직 전달 전일 때만)
+      const migrateLegacyAccount = async function(id) {
+        const local = getStudentAccounts()[id];
+        if (!local) return null;
+        if (getPendingSync().indexOf(String(id)) === -1) {
+          const subRes = await withTimeout(supabaseClient.from('submissions').select('student_id').eq('student_id', String(id)).maybeSingle());
+          if (subRes.error || !subRes.data) return null;
+        }
+        const acc = { student_id: String(id), name: local.name, pw: local.pw };
+        const ins = await withTimeout(supabaseClient.from('students').upsert(acc, { onConflict: 'student_id' }));
+        return ins.error ? null : acc;
+      };
+
+      // 로그인 중인 학생의 계정이 서버에 아직 있는지 확인. 없으면 로그아웃하고 기기 속 사본 삭제
+      const verifyStudentStillExists = async function(user) {
+        if (!cloudReady() || !user || user.role !== 'student') return true;
+        try {
+          const res = await cloudGetAccount(user.id);
+          if (res.error) { if (isNetworkFailure(res)) markOffline(); return true; }
+          if (res.data) {
+            const local = getStudentAccounts()[user.id];
+            if (getPendingSync().indexOf(String(user.id)) !== -1 && local && local.pw !== res.data.pw) {
+              updateCurrentUserSession(null);
+              showToast('서버에 같은 학번의 계정이 있어요. 원래 비밀번호로 다시 로그인하면 이 기기에 쓴 기록이 전달됩니다.', 7000);
+              return false;
+            }
+            pushPendingForStudent(user.id);
+            return true;
+          }
+          if (await migrateLegacyAccount(user.id)) {
+            pushPendingForStudent(user.id);
+            return true;
+          }
+        } catch (err) {
+          if (isNetworkFailure(err)) markOffline();
+          return true;
+        }
+        purgeLocalStudent(user.id);
+        updateCurrentUserSession(null);
+        showToast('삭제되었거나 변경된 계정입니다. 선생님께 문의하세요.');
+        return false;
+      };
+
+      const registerOnThisDevice = function(id, name, pw, reason) {
+        if (getStudentAccounts()[id]) { showToast('이 기기에 이미 등록된 학번입니다. [로그인]으로 들어가 주세요.'); return; }
+        cacheLocalAccount(id, name, pw);
+        const offSub = loadLocalSubmissions()[id] || { studentId: id, studentName: name, classNo: Number(registerClass) || undefined, groupNo: Number(registerGroup) || undefined, reports: {} };
+        putLocalSub(id, offSub);
+        addPendingSync(id);
+        formDirtyRef.current = false;
+        updateCurrentUserSession({ role: 'student', id: id, name: name });
+        setIsRegisterMode(false);
+        showToast((reason ? reason + ' ' : '') + name + ' 님, 이 기기에 등록했습니다. 같은 기기에서 이어서 작성하세요. 서버가 돌아오면 자동으로 전달됩니다.', 6000);
+      };
+
+      const loginOnThisDevice = function(id, pw, reason) {
+        const localAcc = getStudentAccounts()[id];
+        if (!localAcc) {
+          showToast((reason ? reason + ' ' : '') + '이 기기에는 아직 계정이 없어요. [최초 등록하기]로 이 기기에 등록해 주세요.', 6000);
+          return;
+        }
+        if (localAcc.pw !== pw) { showToast('비밀번호가 일치하지 않습니다.'); return; }
+        formDirtyRef.current = false;
+        updateCurrentUserSession({ role: 'student', id: id, name: localAcc.name });
+        showToast((reason ? reason + ' ' : '') + localAcc.name + ' 님, 환영합니다! (오프라인: 이 기기에 저장됩니다)', 5000);
+      };
+
+      const OFFLINE_SWITCH_NOTE = '서버 응답이 없어 오프라인으로 전환했어요.';
+      const ID_RULE = /^\d{4,5}$/;
+
+      const handleStudentRegister = async function(ev) {
+        ev.preventDefault();
+        const id = studentIdInput.trim();
+        const name = studentNameInput.trim();
+        const pw = studentPwInput;
+        if (!ID_RULE.test(id)) { showToast('학번은 숫자 4~5자리로 입력해 주세요.'); return; }
+        if (!name) { showToast('성명을 입력해 주세요.'); return; }
+        if (!/^\d{4}$/.test(pw)) { showToast('비밀번호는 4자리 숫자여야 합니다.'); return; }
+        const regClass = Number(registerClass) || null;
+        const regGroup = Number(registerGroup) || null;
+        if (!regClass) { showToast('내 반을 골라 주세요. (한 번 정하면 바꿀 수 없어요)'); return; }
+        if (!regGroup) { showToast('내 조를 골라 주세요. 몇 조인지 모르면 아래 모둠 목록에서 공연 제목과 조원 이름을 보고 찾으세요.', 5000); return; }
+        if (!window.confirm(name + ' 학생, 2학년 ' + regClass + '반 ' + regGroup + '조가 맞나요?\n등록한 뒤에는 반과 조를 바꿀 수 없어요. (잘못 고르면 선생님께 말씀드려야 해요)')) return;
+
+        if (!cloudReady()) { registerOnThisDevice(id, name, pw); return; }
+        if (authBusy) return;
+
+        setAuthBusy(true);
+        let goOffline = false;
+        try {
+          const accRes = await cloudGetAccount(id);
+          if (accRes.error) {
+            if (isNetworkFailure(accRes)) { goOffline = true; } else { showAccountError(accRes.error); return; }
+          } else {
+            if (accRes.data) { showToast('이미 등록된 학번입니다. [로그인]으로 들어가 주세요.'); return; }
+            const subRes = await withTimeout(supabaseClient.from('submissions').select('student_id').eq('student_id', String(id)).maybeSingle(), SERVER_CHECK_MS);
+            if (isNetworkFailure(subRes)) {
+              goOffline = true;
+            } else if (subRes.data) {
+              showToast('이미 기록이 있는 학번입니다. 처음 가입한 기기에서 로그인하거나 선생님께 문의하세요.');
+              return;
+            } else {
+              const ins = await withTimeout(supabaseClient.from('students').insert({ student_id: String(id), name: name, pw: pw }), SERVER_CHECK_MS);
+              if (ins.error) {
+                if (isNetworkFailure(ins)) { goOffline = true; } else { showAccountError(ins.error); return; }
+              }
+            }
+          }
+        } catch (err) {
+          if (isNetworkFailure(err)) { goOffline = true; } else { showAccountError(err); return; }
+        } finally {
+          setAuthBusy(false);
+        }
+
+        if (goOffline) {
+          markOffline();
+          registerOnThisDevice(id, name, pw, OFFLINE_SWITCH_NOTE);
+          return;
+        }
+
+        purgeLocalStudent(id);
         const initSub = { studentId: id, studentName: name, classNo: regClass, groupNo: regGroup, reports: {} };
         putLocalSub(id, initSub);
         syncStudentToCloud(id, initSub);
